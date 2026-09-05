@@ -1,0 +1,6 @@
+# Hub token and cycle configuration. Copy config.example.h to config.h.
+config.h
+
+# Test build artefacts
+test/harness
+test/extracted.inc

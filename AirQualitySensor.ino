@@ -35,6 +35,16 @@
 #include "CopyTo_esp32_library_MatterEndpoints/MatterWeatherStation.h"
 #include "PMS.h"
 
+// Hub URL, ingest token and cycle timing. Copy config.example.h to config.h.
+#include "config.h"
+
+// Included unconditionally, unlike the block below. Even when the device is
+// commissioned over BLE — so it never calls WiFi.begin() itself — it still runs
+// on Wi-Fi, brought up by the Matter stack from credentials in NVS. We need the
+// API to check association state and to post.
+#include <WiFi.h>
+#include <HTTPClient.h>
+
 
 #include <Wire.h>
 #include <SPI.h>
@@ -65,8 +75,8 @@ MatterWeatherStation weatherStation;
 
 #if !CONFIG_ENABLE_CHIPOBLE
 // WiFi is manually set and started
-const char *ssid = "YOUR_SSID_HERE";
-const char *password = "YOUR_PASSWORD_HERE";
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
 #endif
 const uint8_t buttonPin = BOOT_PIN;
 
@@ -107,6 +117,143 @@ void updateMatterIdentity() {
 unsigned long previousMillis = millis();
 bool isPmsActive = false;
 
+// ---------------------------------------------------------------------------
+// Posting readings to the weather hub
+// ---------------------------------------------------------------------------
+// A second output alongside Matter, so the TV and phone apps can read this
+// sensor without the SmartThings cloud API. Matter is untouched: the clusters
+// are still updated exactly as before and the device stays commissioned, so its
+// tile in the SmartThings app keeps working.
+//
+// Deep sleep resets the CPU and re-runs setup(), so ordinary globals do not
+// survive a cycle and millis() restarts at zero. Anything that must persist
+// lives in RTC memory, which does survive deep sleep (though not a power cut).
+
+RTC_DATA_ATTR uint32_t rtcWakeCount = 0;
+RTC_DATA_ATTR uint32_t rtcPushOk = 0;
+RTC_DATA_ATTR uint32_t rtcPushFailed = 0;
+
+// Readings gathered during this wake, filled in as they are taken. NAN means
+// "not measured this cycle" and the field is left out of the payload rather
+// than sent as a zero that would render on the dashboard as real data.
+struct Reading {
+    float temperature = NAN;
+    float humidity = NAN;
+    float pressure = NAN;
+    float pm1 = NAN;
+    float pm25 = NAN;
+    float pm10 = NAN;
+    bool  havePms = false;
+};
+Reading wakeReading;
+
+// Taken at the top of the wake, before the radio and fan have had time to warm
+// the board. Logged only, never sent — it exists to answer whether the reading
+// taken after the PMS warm-up is skewed by self-heating, or improved by the fan
+// drawing fresh air through the enclosure. Compare the two in the serial log
+// over a few days and the dominant effect becomes obvious.
+float coldTemperature = NAN;
+float coldHumidity = NAN;
+
+static void appendField(char *buf, size_t size, size_t &off, bool &first,
+                        const char *name, const char *fmt, double value) {
+    if (off >= size) return;
+    int n = snprintf(buf + off, size - off, "%s\"%s\":", first ? "" : ",", name);
+    if (n < 0 || (size_t)n >= size - off) { off = size; return; }
+    off += n;
+    n = snprintf(buf + off, size - off, fmt, value);
+    if (n < 0 || (size_t)n >= size - off) { off = size; return; }
+    off += n;
+    first = false;
+}
+
+// Build the reading as JSON. The hub treats every field as optional, so a
+// sensor that failed this cycle is omitted rather than guessed at.
+static bool buildReadingJson(char *buf, size_t size, const Reading &r) {
+    if (size == 0) return false;
+    size_t off = 0;
+    bool first = true;
+    buf[off++] = '{';
+
+    if (!isnan(r.temperature)) appendField(buf, size, off, first, "temperature_c", "%.2f", r.temperature);
+    if (!isnan(r.humidity))    appendField(buf, size, off, first, "humidity_pct",  "%.2f", r.humidity);
+    if (!isnan(r.pressure))    appendField(buf, size, off, first, "pressure_hpa",  "%.2f", r.pressure);
+
+    if (r.havePms) {
+        appendField(buf, size, off, first, "pm1",  "%.1f", r.pm1);
+        appendField(buf, size, off, first, "pm25", "%.1f", r.pm25);
+        appendField(buf, size, off, first, "pm10", "%.1f", r.pm10);
+        // The air-quality enum only means anything alongside the PM values it
+        // was derived from, so it travels with them.
+        appendField(buf, size, off, first, "aqi", "%.0f",
+                    (double)weatherStation.getAirQualityEnum());
+    }
+
+    if (first) return false;            // nothing measured; nothing to send
+    if (off + 2 > size) return false;   // no room to close the object
+    buf[off++] = '}';
+    buf[off] = '\0';
+    return true;
+}
+
+// Wait for the Matter stack to finish reassociating after wake. It reconnects
+// from NVS on its own; we only decide how long to be patient.
+static bool waitForWifi(unsigned long timeoutMs) {
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start > timeoutMs) {
+            Serial.printf("WiFi not connected after %lums (status %d)\r\n",
+                          timeoutMs, (int)WiFi.status());
+            return false;
+        }
+        delay(100);
+    }
+    Serial.printf("WiFi ready after %lums, IP %s\r\n",
+                  millis() - start, WiFi.localIP().toString().c_str());
+    return true;
+}
+
+static void pushReading(const Reading &r) {
+    char body[224];
+    if (!buildReadingJson(body, sizeof(body), r)) {
+        Serial.println("Hub push skipped: nothing measured this cycle");
+        return;
+    }
+
+    if (!waitForWifi(WEATHER_WIFI_WAIT_MS)) {
+        rtcPushFailed++;
+        return;
+    }
+
+    HTTPClient http;
+    http.setConnectTimeout(WEATHER_HUB_TIMEOUT_MS);
+    http.setTimeout(WEATHER_HUB_TIMEOUT_MS);
+    if (!http.begin(WEATHER_HUB_URL)) {
+        Serial.println("Hub push failed: bad URL");
+        rtcPushFailed++;
+        return;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " WEATHER_HUB_TOKEN);
+
+    Serial.printf("Hub push: %s\r\n", body);
+    int code = http.POST((uint8_t *)body, strlen(body));
+    if (code == 200) {
+        rtcPushOk++;
+        Serial.printf("Hub push ok (%lu ok / %lu failed over %lu wakes)\r\n",
+                      rtcPushOk, rtcPushFailed, rtcWakeCount);
+    } else if (code > 0) {
+        // The hub explains rejections in the body, and this is read off a
+        // serial console with no debugger attached.
+        rtcPushFailed++;
+        Serial.printf("Hub push rejected: HTTP %d %s\r\n", code, http.getString().c_str());
+    } else {
+        rtcPushFailed++;
+        Serial.printf("Hub push failed: %s\r\n", HTTPClient::errorToString(code).c_str());
+    }
+    http.end();
+}
+
 void setup()
 {
     pinMode(buttonPin, INPUT_PULLUP); 
@@ -130,6 +277,15 @@ void setup()
         Adafruit_BME280::FILTER_OFF
     );
     
+    // Reference reading taken now, while the board is closest to ambient after
+    // deep sleep. Logged only — see coldTemperature's declaration for why.
+    bme.takeForcedMeasurement();
+    coldTemperature = bme.readTemperature();
+    coldHumidity = bme.readHumidity();
+    rtcWakeCount++;
+    Serial.printf("Wake #%lu - cold reference: %.2f C, %.2f %%\r\n",
+                  rtcWakeCount, coldTemperature, coldHumidity);
+
     pmsSerial.begin(PMS_BAUD);
     pms.passiveMode();
  
@@ -149,9 +305,9 @@ void setup()
     humiditySensor.begin(95.00);
     airSensor.begin(); */
     pms.wakeUp();
-    Serial.print("Wait 30 seconds for PMS to wake up...");
+    Serial.printf("Wait %d seconds for PMS to wake up...", PMS_WARMUP_SECONDS);
     unsigned long currentMillis = millis();
-    while(currentMillis - previousMillis < (unsigned long)30000)
+    while(currentMillis - previousMillis < (unsigned long)PMS_WARMUP_SECONDS * 1000UL)
     {
         delay(100);
         currentMillis = millis();
@@ -251,9 +407,16 @@ void loop()
         Serial.print("Humidity = ");
         Serial.print(humidity);
         Serial.println(" %"); 
+
+        // Keep these for the hub push at the end of the wake.
+        wakeReading.temperature = temperature;
+        wakeReading.pressure = pressure;
+        wakeReading.humidity = humidity;
+        Serial.printf("Warm vs cold: %.2f C (warm) - %.2f C (cold) = %+.2f C\r\n",
+                      temperature, coldTemperature, temperature - coldTemperature);
     }
         
-    if (currentMillis - previousMillis >= (unsigned long)30000) 
+    if (currentMillis - previousMillis >= (unsigned long)PMS_WARMUP_SECONDS * 1000UL) 
     {   
         previousMillis = currentMillis;
         
@@ -275,7 +438,13 @@ void loop()
             Serial.printf("PM10: %.1f ppm\r\n", PM10);
             //airSensor.setPM10(PM10);
             weatherStation.setPM10(PM10);
-            Serial.printf("PM concentration: set\r\n");            
+            Serial.printf("PM concentration: set\r\n");
+
+            // setPM10 was the last setter, so the air-quality enum is current.
+            wakeReading.pm1 = PM1;
+            wakeReading.pm25 = PM25;
+            wakeReading.pm10 = PM10;
+            wakeReading.havePms = true;
         }
         pms.sleep();
         isPmsActive = false;      
@@ -285,9 +454,15 @@ void loop()
     //wait 3 seconds before going to deep sleep - IF PMS is inactive
     if (!isPmsActive) 
     {   
+        // Every reading for this wake now exists, and the device is about to go
+        // dark for minutes — this is the last chance to post. Failures are
+        // swallowed inside pushReading, so a NAS mid-reboot cannot stop the
+        // device sleeping or disturb the Matter side.
+        pushReading(wakeReading);
+
         previousMillis = currentMillis;
         // Set wakeup timer for 300 seconds and enter deep sleep
-        esp_sleep_enable_timer_wakeup(300 * 1000000ULL); // 300 seconds in microseconds
+        esp_sleep_enable_timer_wakeup((uint64_t)SENSOR_SLEEP_SECONDS * 1000000ULL);
         Serial.println("Entering deep sleep in 3 seconds...");
         while(currentMillis - previousMillis < (unsigned long)10000)
         {
