@@ -90,6 +90,9 @@ bool MatterWeatherStation::begin(float temp, float hum, float pres, float pm1, f
     setTemperature(temp);
     setHumidity(hum);
     setPressure(pres);
+    valPM1 = pm1;
+    valPM25 = pm25;
+    valPM10 = pm10;
     setPM1(pm1);
     setPM2_5(pm25);
     setPM10(pm10);

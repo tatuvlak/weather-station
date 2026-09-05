@@ -40,6 +40,7 @@
 #include <SPI.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include "esp_sleep.h"
 #define USEIIC 1
 #define BME_SDA 6
 //#define BME_MISO 12
@@ -103,6 +104,9 @@ void updateMatterIdentity() {
   update_attr(chip::app::Clusters::BasicInformation::Attributes::NodeLabel::Id, "Air Quality Sensor");
 }
 
+unsigned long previousMillis = millis();
+bool isPmsActive = false;
+
 void setup()
 {
     pinMode(buttonPin, INPUT_PULLUP); 
@@ -117,6 +121,14 @@ void setup()
         Serial.print("        ID of 0x60 represents a BME 280.\n");
         Serial.print("        ID of 0x61 represents a BME 680.\n");
     }
+    // Set BME280 to forced mode and oversampling 1x to reduce self-heating
+    bme.setSampling(
+        Adafruit_BME280::MODE_FORCED,
+        Adafruit_BME280::SAMPLING_X1, // temperature
+        Adafruit_BME280::SAMPLING_X1, // pressure
+        Adafruit_BME280::SAMPLING_X1, // humidity
+        Adafruit_BME280::FILTER_OFF
+    );
     
     pmsSerial.begin(PMS_BAUD);
     pms.passiveMode();
@@ -136,7 +148,49 @@ void setup()
     temperatureSensor.begin();    
     humiditySensor.begin(95.00);
     airSensor.begin(); */
-    weatherStation.begin(0.0, 0.0, 900.0, 0.0, 0.0, 0.0);
+    pms.wakeUp();
+    Serial.print("Wait 30 seconds for PMS to wake up...");
+    unsigned long currentMillis = millis();
+    while(currentMillis - previousMillis < (unsigned long)30000)
+    {
+        delay(100);
+        currentMillis = millis();
+        Serial.print(".");
+    }
+    // Take a forced measurement to minimize self-heating
+    bme.takeForcedMeasurement();
+
+    float temperature = bme.readTemperature();
+    Serial.print("Setup Temperature = ");
+    Serial.print(temperature);
+    Serial.println(" °C");        
+
+    float pressure = bme.readPressure() / 100.0F;
+    Serial.print("Setup Pressure = ");
+    Serial.print(pressure);
+    Serial.println(" hPa");        
+
+    float humidity = bme.readHumidity();
+    Serial.print("Setup Humidity = ");
+    Serial.print(humidity);
+    Serial.println(" %"); 
+    Serial.println("Setup Reading PMS data");
+    pms.requestRead();
+    float PM1 = 0.0;
+    float PM25 = 0.0;
+    float PM10 = 0.0;
+    if (pms.readUntil(data))
+    {
+        Serial.println("Setup PMS data recieved");
+        PM1 = data.PM_AE_UG_1_0;
+        Serial.printf("PM1: %.1f ppm\r\n", PM1);
+        PM25 = data.PM_AE_UG_2_5;
+        Serial.printf("PM2.5: %.1f ppm\r\n", PM25);
+        PM10 = data.PM_AE_UG_10_0;
+        Serial.printf("PM10: %.1f ppm\r\n", PM10);         
+    }
+    pms.sleep();
+    weatherStation.begin(temperature, humidity, pressure, PM1, PM25, PM10);
 
     // Start Matter stack after all endpoints
     Matter.begin();
@@ -159,26 +213,50 @@ void setup()
         Serial.println("Matter Node successfully commissioned.");
     }
     
+    previousMillis = millis();
     Serial.println("Setup finished");
 }
 
-unsigned long previousMillis = millis();
-bool pmsWanken = false;
 
 void loop()
 {
     static uint32_t counter = 0;
     
     unsigned long currentMillis = millis();
-    if(!pmsWanken)
+    if(!isPmsActive)
     {
         pms.wakeUp();
-        pmsWanken = true;
+        isPmsActive = true;
+
+        // Take a forced measurement to minimize self-heating
+        bme.takeForcedMeasurement();
+
+        float temperature = bme.readTemperature();
+        //temperatureSensor.setTemperature(temperature);
+        weatherStation.setTemperature(temperature);
+        Serial.print("Temperature = ");
+        Serial.print(temperature);
+        Serial.println(" °C");        
+
+        float pressure = bme.readPressure() / 100.0F;
+        //pressureSensor.setPressure(pressure);
+        weatherStation.setPressure(pressure);
+        Serial.print("Pressure = ");
+        Serial.print(pressure);
+        Serial.println(" hPa");        
+
+        float humidity = bme.readHumidity();
+        //humiditySensor.setHumidity(humidity);
+        weatherStation.setHumidity(humidity);
+        Serial.print("Humidity = ");
+        Serial.print(humidity);
+        Serial.println(" %"); 
     }
         
     if (currentMillis - previousMillis >= (unsigned long)30000) 
     {   
         previousMillis = currentMillis;
+        
         Serial.println(".");
         Serial.println("Reading PMS data");
         pms.requestRead();
@@ -197,31 +275,28 @@ void loop()
             Serial.printf("PM10: %.1f ppm\r\n", PM10);
             //airSensor.setPM10(PM10);
             weatherStation.setPM10(PM10);
-            Serial.printf("PM concentration: set\r\n");
+            Serial.printf("PM concentration: set\r\n");            
         }
         pms.sleep();
-        pmsWanken = false;
+        isPmsActive = false;      
         
-        float pressure = bme.readPressure() / 100.0F;
-        //pressureSensor.setPressure(pressure);
-        weatherStation.setPressure(pressure);
-        Serial.print("Pressure = ");
-        Serial.print(pressure);
-        Serial.println(" hPa");
+    }    
 
-        float temperature = bme.readTemperature();
-//        temperatureSensor.setTemperature(temperature);
-        weatherStation.setTemperature(temperature);
-        Serial.print("Temperature = ");
-        Serial.print(temperature);
-        Serial.println(" °C");        
-
-        float humidity = bme.readHumidity();
-        //humiditySensor.setHumidity(humidity);
-        weatherStation.setHumidity(humidity);
-        Serial.print("Humidity = ");
-        Serial.print(humidity);
-        Serial.println(" %"); 
+    //wait 3 seconds before going to deep sleep - IF PMS is inactive
+    if (!isPmsActive) 
+    {   
+        previousMillis = currentMillis;
+        // Set wakeup timer for 300 seconds and enter deep sleep
+        esp_sleep_enable_timer_wakeup(300 * 1000000ULL); // 300 seconds in microseconds
+        Serial.println("Entering deep sleep in 3 seconds...");
+        while(currentMillis - previousMillis < (unsigned long)10000)
+        {
+            delay(100);
+            currentMillis = millis();
+            Serial.print(".");
+        }
+        Serial.flush();
+        esp_deep_sleep_start();
     }
 
     // Button debounce and long-press for decommissioning
