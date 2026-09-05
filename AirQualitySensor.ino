@@ -147,14 +147,6 @@ struct Reading {
 };
 Reading wakeReading;
 
-// Taken at the top of the wake, before the radio and fan have had time to warm
-// the board. Logged only, never sent — it exists to answer whether the reading
-// taken after the PMS warm-up is skewed by self-heating, or improved by the fan
-// drawing fresh air through the enclosure. Compare the two in the serial log
-// over a few days and the dominant effect becomes obvious.
-float coldTemperature = NAN;
-float coldHumidity = NAN;
-
 static void appendField(char *buf, size_t size, size_t &off, bool &first,
                         const char *name, const char *fmt, double value) {
     if (off >= size) return;
@@ -277,14 +269,18 @@ void setup()
         Adafruit_BME280::FILTER_OFF
     );
     
-    // Reference reading taken now, while the board is closest to ambient after
-    // deep sleep. Logged only — see coldTemperature's declaration for why.
+    // Read the BME now, first thing after waking. The board has been cooling for
+    // the whole deep sleep, so this is the closest it gets to ambient — the
+    // radio and the PMS fan only warm it from here on. This one reading is used
+    // for Matter and for the hub push; nothing re-reads it later in the cycle.
     bme.takeForcedMeasurement();
-    coldTemperature = bme.readTemperature();
-    coldHumidity = bme.readHumidity();
+    wakeReading.temperature = bme.readTemperature();
+    wakeReading.humidity = bme.readHumidity();
+    wakeReading.pressure = bme.readPressure() / 100.0F;
     rtcWakeCount++;
-    Serial.printf("Wake #%lu - cold reference: %.2f C, %.2f %%\r\n",
-                  rtcWakeCount, coldTemperature, coldHumidity);
+    Serial.printf("Wake #%lu - BME: %.2f C, %.2f %%, %.2f hPa\r\n",
+                  rtcWakeCount, wakeReading.temperature, wakeReading.humidity,
+                  wakeReading.pressure);
 
     pmsSerial.begin(PMS_BAUD);
     pms.passiveMode();
@@ -313,23 +309,12 @@ void setup()
         currentMillis = millis();
         Serial.print(".");
     }
-    // Take a forced measurement to minimize self-heating
-    bme.takeForcedMeasurement();
+    // No second BME read here: the values taken at the top of the wake are used
+    // throughout, before the radio and fan had a chance to warm the board.
+    float temperature = wakeReading.temperature;
+    float pressure = wakeReading.pressure;
+    float humidity = wakeReading.humidity;
 
-    float temperature = bme.readTemperature();
-    Serial.print("Setup Temperature = ");
-    Serial.print(temperature);
-    Serial.println(" °C");        
-
-    float pressure = bme.readPressure() / 100.0F;
-    Serial.print("Setup Pressure = ");
-    Serial.print(pressure);
-    Serial.println(" hPa");        
-
-    float humidity = bme.readHumidity();
-    Serial.print("Setup Humidity = ");
-    Serial.print(humidity);
-    Serial.println(" %"); 
     Serial.println("Setup Reading PMS data");
     pms.requestRead();
     float PM1 = 0.0;
@@ -384,36 +369,16 @@ void loop()
         pms.wakeUp();
         isPmsActive = true;
 
-        // Take a forced measurement to minimize self-heating
-        bme.takeForcedMeasurement();
-
-        float temperature = bme.readTemperature();
-        //temperatureSensor.setTemperature(temperature);
-        weatherStation.setTemperature(temperature);
-        Serial.print("Temperature = ");
-        Serial.print(temperature);
-        Serial.println(" °C");        
-
-        float pressure = bme.readPressure() / 100.0F;
-        //pressureSensor.setPressure(pressure);
-        weatherStation.setPressure(pressure);
-        Serial.print("Pressure = ");
-        Serial.print(pressure);
-        Serial.println(" hPa");        
-
-        float humidity = bme.readHumidity();
-        //humiditySensor.setHumidity(humidity);
-        weatherStation.setHumidity(humidity);
-        Serial.print("Humidity = ");
-        Serial.print(humidity);
-        Serial.println(" %"); 
-
-        // Keep these for the hub push at the end of the wake.
-        wakeReading.temperature = temperature;
-        wakeReading.pressure = pressure;
-        wakeReading.humidity = humidity;
-        Serial.printf("Warm vs cold: %.2f C (warm) - %.2f C (cold) = %+.2f C\r\n",
-                      temperature, coldTemperature, temperature - coldTemperature);
+        // Publish the reading taken at the top of the wake. These setters run
+        // after Matter.begin(), which is what actually pushes the values out to
+        // the fabric — begin()'s earlier call only seeds the cluster config.
+        // The board is warmer now than when the values were taken, which is
+        // exactly why they are not re-read here.
+        weatherStation.setTemperature(wakeReading.temperature);
+        weatherStation.setPressure(wakeReading.pressure);
+        weatherStation.setHumidity(wakeReading.humidity);
+        Serial.printf("Published to Matter: %.2f C, %.2f hPa, %.2f %%\r\n",
+                      wakeReading.temperature, wakeReading.pressure, wakeReading.humidity);
     }
         
     if (currentMillis - previousMillis >= (unsigned long)PMS_WARMUP_SECONDS * 1000UL) 
