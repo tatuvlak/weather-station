@@ -16,10 +16,15 @@ bool MatterWeatherStation::begin(float temp, float hum, float pres, float pm1, f
 
     // 1. Create the base endpoint as a PRESSURE SENSOR (0x0305)
     // We create this FIRST to ensure the Pressure Cluster (0x0403) secures its memory slot.
+    // These fields lost their `pressure_` prefix in the ESP32 core somewhere
+    // between 3.3.5 and 3.3.12 (measured_value, not pressure_measured_value).
+    // Matches Espressif's own MatterPressureSensor.cpp, and the temperature and
+    // humidity clusters below, which have always used the short names. Building
+    // this against a core older than the rename will fail here.
     esp_matter::endpoint::pressure_sensor::config_t pres_config;
-    pres_config.pressure_measurement.pressure_measured_value = (int16_t)(pres * 10);
-    pres_config.pressure_measurement.pressure_min_measured_value = nullptr;
-    pres_config.pressure_measurement.pressure_max_measured_value = nullptr;
+    pres_config.pressure_measurement.measured_value = (int16_t)(pres * 10);
+    pres_config.pressure_measurement.min_measured_value = nullptr;
+    pres_config.pressure_measurement.max_measured_value = nullptr;
 
     endpoint_t *endpoint = esp_matter::endpoint::pressure_sensor::create(node::get(), &pres_config, ENDPOINT_FLAG_NONE, (void *)this);
     
