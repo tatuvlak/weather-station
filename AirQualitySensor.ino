@@ -54,6 +54,9 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include "esp_sleep.h"
+// For latching the PMS serial line through deep sleep — see holdPmsLineIdle().
+#include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #define USEIIC 1
 #define BME_SDA 6
 //#define BME_MISO 12
@@ -351,6 +354,53 @@ static void pushReading(const Reading &r) {
     http.end();
 }
 
+// ---------------------------------------------------------------------------
+// Keeping the PMS asleep through deep sleep
+// ---------------------------------------------------------------------------
+// pms.sleep() works — the fan audibly stops. But it starts again the moment
+// the ESP32 deep-sleeps, because the UART peripheral shuts down and the pin we
+// transmit on stops being driven. A floating line at the module's RX reads as
+// activity and wakes it, so the fan ran for the whole five-minute sleep: about
+// 100mA continuously, and a fan rated for ~8000 hours burned at 24 hours a day
+// instead of the ~4.5 the cycle intends.
+//
+// The fix is to keep that pin at the UART idle level (high) and latch it, so
+// it holds through deep sleep instead of floating. The latch survives into the
+// next wake, so it has to be released before the UART can drive the pin again.
+
+static void holdPmsLineIdle() {
+    gpio_num_t tx = (gpio_num_t)PMS_UART_TX_PIN;
+    pmsSerial.flush();   // the sleep command must actually reach the module
+    pmsSerial.end();     // hand the pin back from the UART peripheral
+
+    if (rtc_gpio_is_valid_gpio(tx)) {
+        // Low-power-domain pins keep their state across deep sleep only
+        // through the RTC path; the ordinary GPIO hold does not reach them.
+        rtc_gpio_init(tx);
+        rtc_gpio_set_direction(tx, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(tx, 1);
+        rtc_gpio_hold_en(tx);
+    } else {
+        gpio_reset_pin(tx);
+        gpio_set_direction(tx, GPIO_MODE_OUTPUT);
+        gpio_set_level(tx, 1);
+        gpio_hold_en(tx);
+    }
+    gpio_deep_sleep_hold_en();
+}
+
+// Undo the latch. Without this the pin stays frozen high after waking and the
+// UART cannot drive it, so every PMS read from the second wake onward fails.
+static void releasePmsLineHold() {
+    gpio_num_t tx = (gpio_num_t)PMS_UART_TX_PIN;
+    gpio_deep_sleep_hold_dis();
+    if (rtc_gpio_is_valid_gpio(tx)) {
+        rtc_gpio_hold_dis(tx);
+        rtc_gpio_deinit(tx);
+    }
+    gpio_hold_dis(tx);
+}
+
 void setup()
 {
     pinMode(buttonPin, INPUT_PULLUP); 
@@ -406,7 +456,9 @@ void setup()
                       rtcWakeCount);
     }
 
-    pmsSerial.begin(PMS_BAUD);
+    // Release last cycle's latch before the UART tries to take the pin.
+    releasePmsLineHold();
+    pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_UART_RX_PIN, PMS_UART_TX_PIN);
     pms.passiveMode();
  
 // CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
@@ -611,6 +663,9 @@ void loop()
             currentMillis = millis();
             Serial.print(".");
         }
+        // Last thing before the lights go out: pin the PMS's input line at
+        // idle so the module stays asleep instead of waking on a floating pin.
+        holdPmsLineIdle();
         Serial.flush();
         esp_deep_sleep_start();
     }
