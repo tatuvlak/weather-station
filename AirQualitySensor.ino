@@ -84,6 +84,29 @@ uint32_t button_time_stamp = 0;
 bool button_state = false;
 const uint32_t decommissioningTimeout = 5000;
 
+// Readings gathered during this wake, filled in as they are taken. NAN means
+// "not measured this cycle" and the field is left out of the payload rather
+// than sent as a zero that would render on the dashboard as real data.
+//
+// KEEP THIS ABOVE THE FIRST FUNCTION DEFINITION IN THIS FILE. The Arduino
+// build generates a forward declaration for every function in a .ino and
+// inserts them all immediately before the first function definition
+// (updateMatterIdentity, below). buildReadingJson and pushReading take a
+// Reading, so their generated prototypes name this type — declare it any
+// lower and the build fails with "'Reading' does not name a type", pointing
+// at those functions rather than at this struct. test/run.sh checks the
+// ordering so a tidy-up cannot quietly reintroduce it.
+struct Reading {
+    float temperature = NAN;
+    float humidity = NAN;
+    float pressure = NAN;
+    float pm1 = NAN;
+    float pm25 = NAN;
+    float pm10 = NAN;
+    bool  havePms = false;
+};
+Reading wakeReading;
+
 // Helper function to update the identity
 void updateMatterIdentity() {
   uint16_t endpoint_id = 0; // Root Node
@@ -156,20 +179,6 @@ RTC_DATA_ATTR uint32_t rtcPmsAgeWakes = NEVER_READ;
 static bool canFallBack(uint32_t ageWakes) {
     return ageWakes != NEVER_READ && ageWakes <= MAX_FALLBACK_WAKES;
 }
-
-// Readings gathered during this wake, filled in as they are taken. NAN means
-// "not measured this cycle" and the field is left out of the payload rather
-// than sent as a zero that would render on the dashboard as real data.
-struct Reading {
-    float temperature = NAN;
-    float humidity = NAN;
-    float pressure = NAN;
-    float pm1 = NAN;
-    float pm25 = NAN;
-    float pm10 = NAN;
-    bool  havePms = false;
-};
-Reading wakeReading;
 
 // Read the PMS, retrying a couple of times before giving up. A single miss is
 // common; several in a row on a warmed-up sensor is a real fault.
