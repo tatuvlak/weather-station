@@ -133,6 +133,30 @@ RTC_DATA_ATTR uint32_t rtcWakeCount = 0;
 RTC_DATA_ATTR uint32_t rtcPushOk = 0;
 RTC_DATA_ATTR uint32_t rtcPushFailed = 0;
 
+// Last reading each sensor actually produced, and how many wakes ago. A PMS
+// read fails often enough that seeding Matter with the 0.0 initialisers would
+// publish "perfect air" to the hub on any cycle the sensor misses — which is
+// exactly the dummy data the setup-time reads exist to avoid. Carrying the last
+// good value across a couple of wakes covers a transient miss without hiding a
+// sensor that has actually died.
+RTC_DATA_ATTR float rtcTemperature = NAN;
+RTC_DATA_ATTR float rtcHumidity = NAN;
+RTC_DATA_ATTR float rtcPressure = NAN;
+RTC_DATA_ATTR float rtcPM1 = NAN;
+RTC_DATA_ATTR float rtcPM25 = NAN;
+RTC_DATA_ATTR float rtcPM10 = NAN;
+
+// NEVER_READ means no reading has ever succeeded, so there is nothing to fall
+// back on. Counted in wakes because millis() restarts every deep sleep.
+static const uint32_t NEVER_READ = 9999;
+static const uint32_t MAX_FALLBACK_WAKES = 2;
+RTC_DATA_ATTR uint32_t rtcBmeAgeWakes = NEVER_READ;
+RTC_DATA_ATTR uint32_t rtcPmsAgeWakes = NEVER_READ;
+
+static bool canFallBack(uint32_t ageWakes) {
+    return ageWakes != NEVER_READ && ageWakes <= MAX_FALLBACK_WAKES;
+}
+
 // Readings gathered during this wake, filled in as they are taken. NAN means
 // "not measured this cycle" and the field is left out of the payload rather
 // than sent as a zero that would render on the dashboard as real data.
@@ -146,6 +170,53 @@ struct Reading {
     bool  havePms = false;
 };
 Reading wakeReading;
+
+// Read the PMS, retrying a couple of times before giving up. A single miss is
+// common; several in a row on a warmed-up sensor is a real fault.
+static bool readPms(PMS::DATA &out, uint8_t attempts = 3) {
+    for (uint8_t i = 1; i <= attempts; ++i) {
+        pms.requestRead();
+        if (pms.readUntil(out)) {
+            if (i > 1) Serial.printf("PMS read succeeded on attempt %u\r\n", i);
+            return true;
+        }
+        Serial.printf("PMS read attempt %u of %u failed\r\n", i, attempts);
+    }
+    return false;
+}
+
+// Read the BME, retrying a couple of times. Same reasoning as readPms: one
+// failed forced measurement is not evidence the sensor is gone, and on a cold
+// boot there is no RTC value to fall back on, so it is worth asking again
+// before the cluster gets seeded with a number nothing measured.
+static bool readBme(float &t, float &h, float &pr, uint8_t attempts = 3) {
+    for (uint8_t i = 1; i <= attempts; ++i) {
+        bme.takeForcedMeasurement();
+        t = bme.readTemperature();
+        h = bme.readHumidity();
+        pr = bme.readPressure() / 100.0F;
+        if (!isnan(t) && !isnan(h) && !isnan(pr)) {
+            if (i > 1) Serial.printf("BME read succeeded on attempt %u\r\n", i);
+            return true;
+        }
+        Serial.printf("BME read attempt %u of %u failed\r\n", i, attempts);
+        delay(20);
+    }
+    return false;
+}
+
+// Record a successful particulate reading everywhere it is needed: the values
+// to publish this wake, and the RTC copy that survives deep sleep.
+static void acceptPms(float pm1, float pm25, float pm10) {
+    wakeReading.pm1 = pm1;
+    wakeReading.pm25 = pm25;
+    wakeReading.pm10 = pm10;
+    wakeReading.havePms = true;
+    rtcPM1 = pm1;
+    rtcPM25 = pm25;
+    rtcPM10 = pm10;
+    rtcPmsAgeWakes = 0;
+}
 
 static void appendField(char *buf, size_t size, size_t &off, bool &first,
                         const char *name, const char *fmt, double value) {
@@ -273,14 +344,33 @@ void setup()
     // the whole deep sleep, so this is the closest it gets to ambient — the
     // radio and the PMS fan only warm it from here on. This one reading is used
     // for Matter and for the hub push; nothing re-reads it later in the cycle.
-    bme.takeForcedMeasurement();
-    wakeReading.temperature = bme.readTemperature();
-    wakeReading.humidity = bme.readHumidity();
-    wakeReading.pressure = bme.readPressure() / 100.0F;
     rtcWakeCount++;
-    Serial.printf("Wake #%lu - BME: %.2f C, %.2f %%, %.2f hPa\r\n",
-                  rtcWakeCount, wakeReading.temperature, wakeReading.humidity,
-                  wakeReading.pressure);
+    if (rtcBmeAgeWakes != NEVER_READ) rtcBmeAgeWakes++;
+    if (rtcPmsAgeWakes != NEVER_READ) rtcPmsAgeWakes++;
+
+    float t = NAN, h = NAN, pr = NAN;
+    if (readBme(t, h, pr)) {
+        wakeReading.temperature = t;
+        wakeReading.humidity = h;
+        wakeReading.pressure = pr;
+        rtcTemperature = t;
+        rtcHumidity = h;
+        rtcPressure = pr;
+        rtcBmeAgeWakes = 0;
+        Serial.printf("Wake #%lu - BME: %.2f C, %.2f %%, %.2f hPa\r\n",
+                      rtcWakeCount, t, h, pr);
+    } else if (canFallBack(rtcBmeAgeWakes)) {
+        wakeReading.temperature = rtcTemperature;
+        wakeReading.humidity = rtcHumidity;
+        wakeReading.pressure = rtcPressure;
+        Serial.printf("Wake #%lu - BME read failed, reusing value from %lu wake(s) ago\r\n",
+                      rtcWakeCount, rtcBmeAgeWakes);
+    } else {
+        // Leaves wakeReading as NAN: the hub omits the fields rather than
+        // receiving a fabricated number.
+        Serial.printf("Wake #%lu - BME read failed and no recent value to reuse\r\n",
+                      rtcWakeCount);
+    }
 
     pmsSerial.begin(PMS_BAUD);
     pms.passiveMode();
@@ -316,22 +406,53 @@ void setup()
     float humidity = wakeReading.humidity;
 
     Serial.println("Setup Reading PMS data");
-    pms.requestRead();
-    float PM1 = 0.0;
-    float PM25 = 0.0;
-    float PM10 = 0.0;
-    if (pms.readUntil(data))
+    if (readPms(data))
     {
         Serial.println("Setup PMS data recieved");
-        PM1 = data.PM_AE_UG_1_0;
-        Serial.printf("PM1: %.1f ppm\r\n", PM1);
-        PM25 = data.PM_AE_UG_2_5;
-        Serial.printf("PM2.5: %.1f ppm\r\n", PM25);
-        PM10 = data.PM_AE_UG_10_0;
-        Serial.printf("PM10: %.1f ppm\r\n", PM10);         
+        acceptPms(data.PM_AE_UG_1_0, data.PM_AE_UG_2_5, data.PM_AE_UG_10_0);
+        Serial.printf("PM1: %.1f ppm\r\n", wakeReading.pm1);
+        Serial.printf("PM2.5: %.1f ppm\r\n", wakeReading.pm25);
+        Serial.printf("PM10: %.1f ppm\r\n", wakeReading.pm10);
+    }
+    else if (canFallBack(rtcPmsAgeWakes))
+    {
+        wakeReading.pm1 = rtcPM1;
+        wakeReading.pm25 = rtcPM25;
+        wakeReading.pm10 = rtcPM10;
+        wakeReading.havePms = true;
+        Serial.printf("PMS read failed, reusing values from %lu wake(s) ago\r\n",
+                      rtcPmsAgeWakes);
+    }
+    else
+    {
+        Serial.println("PMS read failed and no recent values to reuse");
     }
     pms.sleep();
-    weatherStation.begin(temperature, humidity, pressure, PM1, PM25, PM10);
+
+    // begin() creates the endpoints, so it cannot be skipped, and it needs a
+    // number for each attribute. Everywhere else a reading we do not have is
+    // simply not published — the loop's setters below are guarded, so a missing
+    // sensor leaves its cluster untouched rather than reporting 0 C and perfect
+    // air, which is worse than a gap because it looks like data.
+    //
+    // The one case these placeholders are still visible is a cold boot (no RTC
+    // history) where the sensor fails every retry: the endpoint is created with
+    // them and stays that way until a read succeeds. readBme/readPms retry to
+    // make that unlikely; a sensor that is genuinely dead will show 0 C, and
+    // the serial log says which one is missing.
+    bool haveBme = !isnan(wakeReading.temperature);
+    if (!haveBme || !wakeReading.havePms) {
+        Serial.printf("Seeding Matter with partial data (BME %s, PMS %s)\r\n",
+                      haveBme ? "ok" : "MISSING",
+                      wakeReading.havePms ? "ok" : "MISSING");
+    }
+    weatherStation.begin(
+        haveBme ? wakeReading.temperature : 0.0f,
+        haveBme ? wakeReading.humidity : 0.0f,
+        haveBme ? wakeReading.pressure : 900.0f,
+        wakeReading.havePms ? wakeReading.pm1 : 0.0f,
+        wakeReading.havePms ? wakeReading.pm25 : 0.0f,
+        wakeReading.havePms ? wakeReading.pm10 : 0.0f);
 
     // Start Matter stack after all endpoints
     Matter.begin();
@@ -374,11 +495,25 @@ void loop()
         // the fabric — begin()'s earlier call only seeds the cluster config.
         // The board is warmer now than when the values were taken, which is
         // exactly why they are not re-read here.
-        weatherStation.setTemperature(wakeReading.temperature);
-        weatherStation.setPressure(wakeReading.pressure);
-        weatherStation.setHumidity(wakeReading.humidity);
-        Serial.printf("Published to Matter: %.2f C, %.2f hPa, %.2f %%\r\n",
-                      wakeReading.temperature, wakeReading.pressure, wakeReading.humidity);
+        //
+        // NAN means the BME gave nothing this wake and there was no recent
+        // value to reuse. The cluster stores temperature as a scaled int16, so
+        // a NAN would arrive as a garbage number and propagate to SmartThings
+        // as a real reading. Publish nothing instead and let the cluster keep
+        // what it last held. The three are read and stored as a group, so one
+        // test covers all of them.
+        if (!isnan(wakeReading.temperature))
+        {
+            weatherStation.setTemperature(wakeReading.temperature);
+            weatherStation.setPressure(wakeReading.pressure);
+            weatherStation.setHumidity(wakeReading.humidity);
+            Serial.printf("Published to Matter: %.2f C, %.2f hPa, %.2f %%\r\n",
+                          wakeReading.temperature, wakeReading.pressure, wakeReading.humidity);
+        }
+        else
+        {
+            Serial.println("No BME reading this wake - Matter keeps its previous value");
+        }
     }
         
     if (currentMillis - previousMillis >= (unsigned long)PMS_WARMUP_SECONDS * 1000UL) 
@@ -387,29 +522,36 @@ void loop()
         
         Serial.println(".");
         Serial.println("Reading PMS data");
-        pms.requestRead();
-        if (pms.readUntil(data))
+        if (readPms(data))
         {
             Serial.println("PMS data recieved");
-            float PM1 = data.PM_AE_UG_1_0;
-            Serial.printf("PM1: %.1f ppm\r\n", PM1);
-            //airSensor.setPM1(PM1);
-            weatherStation.setPM1(PM1);
-            float PM25 = data.PM_AE_UG_2_5;
-            Serial.printf("PM2.5: %.1f ppm\r\n", PM25);
-            //airSensor.setPM2_5(PM25);
-            weatherStation.setPM2_5(PM25);
-            float PM10 = data.PM_AE_UG_10_0;
-            Serial.printf("PM10: %.1f ppm\r\n", PM10);
-            //airSensor.setPM10(PM10);
-            weatherStation.setPM10(PM10);
+            acceptPms(data.PM_AE_UG_1_0, data.PM_AE_UG_2_5, data.PM_AE_UG_10_0);
+            Serial.printf("PM1: %.1f ppm\r\n", wakeReading.pm1);
+            Serial.printf("PM2.5: %.1f ppm\r\n", wakeReading.pm25);
+            Serial.printf("PM10: %.1f ppm\r\n", wakeReading.pm10);
+            weatherStation.setPM1(wakeReading.pm1);
+            weatherStation.setPM2_5(wakeReading.pm25);
+            weatherStation.setPM10(wakeReading.pm10);
+            // setPM10 was the last setter, so the air-quality enum is current
+            // by the time the hub push reads it.
             Serial.printf("PM concentration: set\r\n");
-
-            // setPM10 was the last setter, so the air-quality enum is current.
-            wakeReading.pm1 = PM1;
-            wakeReading.pm25 = PM25;
-            wakeReading.pm10 = PM10;
-            wakeReading.havePms = true;
+        }
+        else if (wakeReading.havePms)
+        {
+            // Nothing new, but this wake does have a particulate value —
+            // measured in setup() or carried over from a recent wake. Publish
+            // that, so the cluster and the hub agree on what this wake reported.
+            weatherStation.setPM1(wakeReading.pm1);
+            weatherStation.setPM2_5(wakeReading.pm25);
+            weatherStation.setPM10(wakeReading.pm10);
+            Serial.println("PMS read failed - published the value taken earlier this wake");
+        }
+        else
+        {
+            // Nothing measured and nothing recent enough to reuse. The zeros
+            // the cluster was seeded with would read as pristine air, so leave
+            // the cluster alone and let the gap show.
+            Serial.println("PMS read failed and no value to publish - Matter keeps its previous");
         }
         pms.sleep();
         isPmsActive = false;      
