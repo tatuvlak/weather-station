@@ -164,6 +164,8 @@ void MatterWeatherStation::updateAQIStatus() {
     else
         enumaq = 6; // Extremely Poor
 
+    valAQI = enumaq;
+
     esp_matter_attr_val_t attr = esp_matter_enum8(enumaq);
     // FIX: Use getEndPointId() instead of aq_endpoint_id
     attribute::update(getEndPointId(), 0x005B, 0x0000, &attr);
