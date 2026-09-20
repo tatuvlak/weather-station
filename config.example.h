@@ -44,6 +44,13 @@
 // the airflow and the laser chamber to settle.
 #define PMS_WARMUP_SECONDS 30
 
+// PMS5003 serial pins, named from the ESP32's point of view. The module's TX
+// pad goes to the pin we receive on; its RX pad to the pin we transmit on.
+// Pinned explicitly rather than relying on the core's Serial2 defaults, which
+// are not guaranteed to stay put across core versions.
+#define PMS_UART_RX_PIN 4   // ESP32 receives here  <- module TX
+#define PMS_UART_TX_PIN 5   // ESP32 transmits here -> module RX
+
 // ---------------------------------------------------------------------------
 // Wi-Fi — only for builds WITHOUT BLE commissioning
 // ---------------------------------------------------------------------------
