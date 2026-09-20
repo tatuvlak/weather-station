@@ -44,6 +44,9 @@
 // API to check association state and to post.
 #include <WiFi.h>
 #include <HTTPClient.h>
+// For esp_netif_get_ip_info: the only reliable way to ask whether this device
+// is on the network, given that Matter and not Arduino brought it up.
+#include <esp_netif.h>
 
 
 #include <Wire.h>
@@ -268,20 +271,42 @@ static bool buildReadingJson(char *buf, size_t size, const Reading &r) {
     return true;
 }
 
+// Has the station got an address yet?
+//
+// Do NOT use WiFi.status() here. The Matter stack owns this connection: it
+// brings the station up through ESP-IDF directly, using credentials it holds
+// in NVS, and never goes through the Arduino WiFi object. So WiFi.status()
+// reports WL_STOPPED (254) the whole time the device is perfectly happily
+// associated and talking to the fabric — which silently skipped every hub
+// push while SmartThings kept updating over the very same connection.
+//
+// The network interface knows the truth whoever brought it up, so ask that.
+// Sockets go through lwIP and do not care which layer connected either.
+static bool stationHasIp(IPAddress *out) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == nullptr) return false;
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(netif, &ip) != ESP_OK) return false;
+    if (ip.ip.addr == 0) return false;          // up, but no DHCP lease yet
+    if (out != nullptr) *out = IPAddress(ip.ip.addr);
+    return true;
+}
+
 // Wait for the Matter stack to finish reassociating after wake. It reconnects
 // from NVS on its own; we only decide how long to be patient.
 static bool waitForWifi(unsigned long timeoutMs) {
     unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED) {
+    IPAddress ip;
+    while (!stationHasIp(&ip)) {
         if (millis() - start > timeoutMs) {
-            Serial.printf("WiFi not connected after %lums (status %d)\r\n",
-                          timeoutMs, (int)WiFi.status());
+            Serial.printf("No IP after %lums - skipping hub push this cycle\r\n",
+                          timeoutMs);
             return false;
         }
         delay(100);
     }
-    Serial.printf("WiFi ready after %lums, IP %s\r\n",
-                  millis() - start, WiFi.localIP().toString().c_str());
+    Serial.printf("Network ready after %lums, IP %s\r\n",
+                  millis() - start, ip.toString().c_str());
     return true;
 }
 

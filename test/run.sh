@@ -46,7 +46,7 @@ print("  ok  struct Reading (line %d) precedes the first function (line %d)"
       % (struct_at, func_at))
 
 start = src.index("static void appendField")
-end = src.index("// Wait for the Matter stack")
+end = src.index("// Has the station got an address yet?")
 pathlib.Path("extracted.inc").write_text(src[start:end])
 PY
 
