@@ -368,37 +368,36 @@ static void pushReading(const Reading &r) {
 // it holds through deep sleep instead of floating. The latch survives into the
 // next wake, so it has to be released before the UART can drive the pin again.
 
+// Only low-power-domain pins (GPIO0-7 on the C6) keep a level through deep
+// sleep, and only via the RTC path. This chip has no equivalent for ordinary
+// digital pins — gpio_deep_sleep_hold_en() exists on the S2/S3 but not here —
+// so the wire has to be on an LP pin for any of this to work. GPIO5 is.
 static void holdPmsLineIdle() {
     gpio_num_t tx = (gpio_num_t)PMS_UART_TX_PIN;
     pmsSerial.flush();   // the sleep command must actually reach the module
     pmsSerial.end();     // hand the pin back from the UART peripheral
 
-    if (rtc_gpio_is_valid_gpio(tx)) {
-        // Low-power-domain pins keep their state across deep sleep only
-        // through the RTC path; the ordinary GPIO hold does not reach them.
-        rtc_gpio_init(tx);
-        rtc_gpio_set_direction(tx, RTC_GPIO_MODE_OUTPUT_ONLY);
-        rtc_gpio_set_level(tx, 1);
-        rtc_gpio_hold_en(tx);
-    } else {
-        gpio_reset_pin(tx);
-        gpio_set_direction(tx, GPIO_MODE_OUTPUT);
-        gpio_set_level(tx, 1);
-        gpio_hold_en(tx);
+    if (!rtc_gpio_is_valid_gpio(tx)) {
+        // Fail loudly rather than sleeping with the fan running and no clue
+        // why. Moving the wire to a non-LP pin breaks this silently otherwise.
+        Serial.printf("GPIO%d is not a low-power pin - cannot hold it through "
+                      "deep sleep, so the PMS fan will keep running\r\n",
+                      (int)tx);
+        return;
     }
-    gpio_deep_sleep_hold_en();
+    rtc_gpio_init(tx);
+    rtc_gpio_set_direction(tx, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(tx, 1);   // UART idle
+    rtc_gpio_hold_en(tx);
 }
 
 // Undo the latch. Without this the pin stays frozen high after waking and the
 // UART cannot drive it, so every PMS read from the second wake onward fails.
 static void releasePmsLineHold() {
     gpio_num_t tx = (gpio_num_t)PMS_UART_TX_PIN;
-    gpio_deep_sleep_hold_dis();
-    if (rtc_gpio_is_valid_gpio(tx)) {
-        rtc_gpio_hold_dis(tx);
-        rtc_gpio_deinit(tx);
-    }
-    gpio_hold_dis(tx);
+    if (!rtc_gpio_is_valid_gpio(tx)) return;
+    rtc_gpio_hold_dis(tx);
+    rtc_gpio_deinit(tx);   // back to the digital mux, ready for the UART
 }
 
 void setup()
