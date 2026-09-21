@@ -368,36 +368,13 @@ static void pushReading(const Reading &r) {
 // it holds through deep sleep instead of floating. The latch survives into the
 // next wake, so it has to be released before the UART can drive the pin again.
 
-// Only low-power-domain pins (GPIO0-7 on the C6) keep a level through deep
-// sleep, and only via the RTC path. This chip has no equivalent for ordinary
-// digital pins — gpio_deep_sleep_hold_en() exists on the S2/S3 but not here.
-static void latchPin(gpio_num_t pin, int level) {
-    if (!rtc_gpio_is_valid_gpio(pin)) {
-        // Fail loudly rather than sleeping with the fan running and no clue
-        // why. Moving a wire to a non-LP pin breaks this silently otherwise.
-        Serial.printf("GPIO%d is not a low-power pin - it cannot hold a level "
-                      "through deep sleep\r\n", (int)pin);
-        return;
-    }
-    rtc_gpio_init(pin);
-    rtc_gpio_set_direction(pin, RTC_GPIO_MODE_OUTPUT_ONLY);
-    rtc_gpio_set_level(pin, level);
-    rtc_gpio_hold_en(pin);
-}
-
-static void releasePin(gpio_num_t pin) {
-    if (!rtc_gpio_is_valid_gpio(pin)) return;
-    rtc_gpio_hold_dis(pin);
-    rtc_gpio_deinit(pin);   // back to the digital mux
-}
-
 // Stop the PMS for the duration of deep sleep.
 //
-// pms.sleep() is not enough. The fan audibly stops when it is sent, then
-// starts again the moment the ESP32 sleeps, and holding our transmit line at
-// idle does not prevent it — so the module is not being woken by a floating
-// pin, it simply does not stay in software sleep. SET, the pin designed for
-// this, is not populated in this module's cable.
+// pms.sleep() is not enough: the fan audibly stops when it is sent, then
+// starts again the moment the ESP32 sleeps. Parking our transmit line at idle
+// did not help either, so the module is not being woken by a floating pin — it
+// simply does not stay in software sleep. SET, the pin designed for this, is
+// not populated in this module's cable.
 //
 // RST is, and it is a level rather than a command: held low the module's MCU
 // stays in reset and the fan stops, for exactly as long as it is held.
@@ -406,20 +383,35 @@ static void releasePin(gpio_num_t pin) {
 // Left running, the fan burns ~100mA continuously and spends its ~8000 hour
 // life at 24 hours a day instead of the ~4.5 this cycle intends — under a
 // year rather than a decade.
+//
+// Only low-power pins (GPIO0-7 on the C6) can hold a level through deep sleep,
+// and only via the RTC path: this chip has no equivalent for ordinary digital
+// pins, gpio_deep_sleep_hold_en() being an S2/S3 thing.
 static void holdPmsOff() {
-    pmsSerial.flush();   // let anything queued actually go out
-    pmsSerial.end();     // hand the pin back from the UART peripheral
-    latchPin((gpio_num_t)PMS_RST_PIN, 0);       // reset asserted: fan stops
-    latchPin((gpio_num_t)PMS_UART_TX_PIN, 1);   // and do not float into its RX
+    gpio_num_t rst = (gpio_num_t)PMS_RST_PIN;
+    if (!rtc_gpio_is_valid_gpio(rst)) {
+        // Fail loudly rather than sleeping with the fan running and no clue
+        // why. Moving the wire to a non-LP pin breaks this silently otherwise.
+        Serial.printf("GPIO%d is not a low-power pin - it cannot hold the PMS "
+                      "in reset through deep sleep, so the fan will keep "
+                      "running\r\n", (int)rst);
+        return;
+    }
+    rtc_gpio_init(rst);
+    rtc_gpio_set_direction(rst, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(rst, 0);
+    rtc_gpio_hold_en(rst);
 }
 
-// Release the latches and bring the module back. Without this the pins stay
-// frozen after waking, the UART cannot drive its own line, and the module
-// never leaves reset — so every read from the second wake onward would fail.
+// Release the latch and bring the module back. Without this the pin stays
+// frozen low after waking, the module never leaves reset, and every read from
+// the second wake onward fails.
 static void releasePmsHold() {
-    releasePin((gpio_num_t)PMS_UART_TX_PIN);
-    releasePin((gpio_num_t)PMS_RST_PIN);
-
+    gpio_num_t rst = (gpio_num_t)PMS_RST_PIN;
+    if (rtc_gpio_is_valid_gpio(rst)) {
+        rtc_gpio_hold_dis(rst);
+        rtc_gpio_deinit(rst);   // back to the digital mux
+    }
     // Out of reset, then a moment to boot before the UART talks to it. It
     // comes up in active mode; setup() sends passiveMode() again right after.
     pinMode(PMS_RST_PIN, OUTPUT);
