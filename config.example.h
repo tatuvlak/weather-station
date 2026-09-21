@@ -51,6 +51,16 @@
 #define PMS_UART_RX_PIN 4   // ESP32 receives here  <- module TX
 #define PMS_UART_TX_PIN 5   // ESP32 transmits here -> module RX
 
+// PMS5003 RESET line. Held low, the module's MCU stays in reset and the fan
+// stops; released, it boots and spins up again. This is the only working off
+// switch on this build: the UART sleep command does not survive the ESP32's
+// deep sleep, and SET is not populated in this module's cable.
+//
+// Must be a low-power pin (GPIO0-7 on the C6) so it can hold its level while
+// the chip sleeps. 4 and 5 are the PMS UART, 6 and 7 are the BME, so 0-3 are
+// what is left.
+#define PMS_RST_PIN 3
+
 // ---------------------------------------------------------------------------
 // Wi-Fi — only for builds WITHOUT BLE commissioning
 // ---------------------------------------------------------------------------
