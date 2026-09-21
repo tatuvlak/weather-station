@@ -143,8 +143,6 @@ void updateMatterIdentity() {
   update_attr(chip::app::Clusters::BasicInformation::Attributes::NodeLabel::Id, "Air Quality Sensor");
 }
 
-unsigned long previousMillis = millis();
-bool isPmsActive = false;
 
 // ---------------------------------------------------------------------------
 // Posting readings to the weather hub
@@ -518,13 +516,17 @@ void setup()
     temperatureSensor.begin();    
     humiditySensor.begin(95.00);
     airSensor.begin(); */
+    // One warm-up per wake, timed from the moment the fan actually starts.
+    // It used to be measured from boot, so the fan ran slightly less than
+    // PMS_WARMUP_SECONDS — and there used to be a second warm-up in loop(),
+    // whose reading overwrote this one. Now the module is read once, and this
+    // is the reading everything uses: Matter, begin(), and the hub push.
     pms.wakeUp();
-    Serial.printf("Wait %d seconds for PMS to wake up...", PMS_WARMUP_SECONDS);
-    unsigned long currentMillis = millis();
-    while(currentMillis - previousMillis < (unsigned long)PMS_WARMUP_SECONDS * 1000UL)
+    unsigned long warmupStart = millis();
+    Serial.printf("Warming the PMS for %d seconds...", PMS_WARMUP_SECONDS);
+    while (millis() - warmupStart < (unsigned long)PMS_WARMUP_SECONDS * 1000UL)
     {
         delay(100);
-        currentMillis = millis();
         Serial.print(".");
     }
     // No second BME read here: the values taken at the top of the wake are used
@@ -603,26 +605,22 @@ void setup()
         Serial.println("Matter Node successfully commissioned.");
     }
     
-    previousMillis = millis();
     Serial.println("Setup finished");
 }
 
 
 void loop()
 {
-    static uint32_t counter = 0;
-    
-    unsigned long currentMillis = millis();
-    if(!isPmsActive)
-    {
-        pms.wakeUp();
-        isPmsActive = true;
+    static bool published = false;
+    static unsigned long publishedAt = 0;
 
-        // Publish the reading taken at the top of the wake. These setters run
-        // after Matter.begin(), which is what actually pushes the values out to
-        // the fabric — begin()'s earlier call only seeds the cluster config.
-        // The board is warmer now than when the values were taken, which is
-        // exactly why they are not re-read here.
+    if (!published)
+    {
+        // Publish this wake's readings. These setters run after Matter.begin(),
+        // which is what actually pushes values out to the fabric — begin()'s
+        // earlier call only seeds the cluster config. Both sensors were read
+        // once in setup() and nothing is re-read here: the PMS had a single
+        // warm-up, and the board is warmer now than when the BME was sampled.
         //
         // NAN means the BME gave nothing this wake and there was no recent
         // value to reuse. The cluster stores temperature as a scaled int16, so
@@ -642,69 +640,41 @@ void loop()
         {
             Serial.println("No BME reading this wake - Matter keeps its previous value");
         }
-    }
-        
-    if (currentMillis - previousMillis >= (unsigned long)PMS_WARMUP_SECONDS * 1000UL) 
-    {   
-        previousMillis = currentMillis;
-        
-        Serial.println(".");
-        Serial.println("Reading PMS data");
-        if (readPms(data))
+
+        if (wakeReading.havePms)
         {
-            Serial.println("PMS data recieved");
-            acceptPms(data.PM_AE_UG_1_0, data.PM_AE_UG_2_5, data.PM_AE_UG_10_0);
-            Serial.printf("PM1: %.1f ppm\r\n", wakeReading.pm1);
-            Serial.printf("PM2.5: %.1f ppm\r\n", wakeReading.pm25);
-            Serial.printf("PM10: %.1f ppm\r\n", wakeReading.pm10);
             weatherStation.setPM1(wakeReading.pm1);
             weatherStation.setPM2_5(wakeReading.pm25);
             weatherStation.setPM10(wakeReading.pm10);
             // setPM10 was the last setter, so the air-quality enum is current
             // by the time the hub push reads it.
-            Serial.printf("PM concentration: set\r\n");
-        }
-        else if (wakeReading.havePms)
-        {
-            // Nothing new, but this wake does have a particulate value —
-            // measured in setup() or carried over from a recent wake. Publish
-            // that, so the cluster and the hub agree on what this wake reported.
-            weatherStation.setPM1(wakeReading.pm1);
-            weatherStation.setPM2_5(wakeReading.pm25);
-            weatherStation.setPM10(wakeReading.pm10);
-            Serial.println("PMS read failed - published the value taken earlier this wake");
+            Serial.printf("Published to Matter: PM %.1f / %.1f / %.1f\r\n",
+                          wakeReading.pm1, wakeReading.pm25, wakeReading.pm10);
         }
         else
         {
-            // Nothing measured and nothing recent enough to reuse. The zeros
-            // the cluster was seeded with would read as pristine air, so leave
-            // the cluster alone and let the gap show.
-            Serial.println("PMS read failed and no value to publish - Matter keeps its previous");
+            // The zeros the cluster was seeded with would read as pristine air,
+            // so leave it alone and let the gap show.
+            Serial.println("No PM reading this wake - Matter keeps its previous value");
         }
-        pms.sleep();
-        isPmsActive = false;      
-        
-    }    
 
-    //wait 3 seconds before going to deep sleep - IF PMS is inactive
-    if (!isPmsActive) 
-    {   
         // Every reading for this wake now exists, and the device is about to go
         // dark for minutes — this is the last chance to post. Failures are
         // swallowed inside pushReading, so a NAS mid-reboot cannot stop the
         // device sleeping or disturb the Matter side.
         pushReading(wakeReading);
 
-        previousMillis = currentMillis;
-        // Set wakeup timer for 300 seconds and enter deep sleep
+        published = true;
+        publishedAt = millis();
+        Serial.printf("Entering deep sleep in %d seconds...\r\n", MATTER_SETTLE_SECONDS);
+    }
+
+    // Settle window. Not a blocking wait: the button handling below has to keep
+    // running, because this is the only part of the wake where the loop turns
+    // over at all — everything before it is spent blocked on the PMS warm-up.
+    if (millis() - publishedAt >= (unsigned long)MATTER_SETTLE_SECONDS * 1000UL)
+    {
         esp_sleep_enable_timer_wakeup((uint64_t)SENSOR_SLEEP_SECONDS * 1000000ULL);
-        Serial.println("Entering deep sleep in 3 seconds...");
-        while(currentMillis - previousMillis < (unsigned long)10000)
-        {
-            delay(100);
-            currentMillis = millis();
-            Serial.print(".");
-        }
         // Last thing before the lights go out: hold the PMS in reset so its
         // fan stays stopped for the whole sleep.
         holdPmsOff();
