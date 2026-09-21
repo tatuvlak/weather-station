@@ -313,6 +313,38 @@ static bool waitForWifi(unsigned long timeoutMs) {
     return true;
 }
 
+// A single POST. Returns the HTTP status, or a negative HTTPClient error code,
+// or 0 for "do not bother trying again". Logs its own outcome, since this is
+// read off a serial console with no debugger attached.
+static int attemptPush(const char *body) {
+    HTTPClient http;
+    http.setConnectTimeout(WEATHER_HUB_TIMEOUT_MS);
+    http.setTimeout(WEATHER_HUB_TIMEOUT_MS);
+    if (!http.begin(WEATHER_HUB_URL)) {
+        Serial.println("Hub push failed: bad URL");
+        return 0;   // never a real status or error code
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " WEATHER_HUB_TOKEN);
+
+    int code = http.POST((uint8_t *)body, strlen(body));
+    if (code > 0 && code != 200) {
+        // The hub explains rejections in the body.
+        Serial.printf("Hub push rejected: HTTP %d %s\r\n", code, http.getString().c_str());
+    } else if (code <= 0) {
+        Serial.printf("Hub push failed: %s\r\n", HTTPClient::errorToString(code).c_str());
+    }
+    http.end();
+    return code;
+}
+
+// Transport failures and 5xx are what a NAS under load produces, and they pass.
+// A 4xx is the hub telling us the request itself is wrong — a bad token will
+// still be bad in two seconds, so repeating it only burns the wake window.
+static bool worthRetrying(int code) {
+    return code < 0 || code >= 500;
+}
+
 static void pushReading(const Reading &r) {
     char body[224];
     if (!buildReadingJson(body, sizeof(body), r)) {
@@ -325,33 +357,25 @@ static void pushReading(const Reading &r) {
         return;
     }
 
-    HTTPClient http;
-    http.setConnectTimeout(WEATHER_HUB_TIMEOUT_MS);
-    http.setTimeout(WEATHER_HUB_TIMEOUT_MS);
-    if (!http.begin(WEATHER_HUB_URL)) {
-        Serial.println("Hub push failed: bad URL");
-        rtcPushFailed++;
-        return;
-    }
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " WEATHER_HUB_TOKEN);
-
     Serial.printf("Hub push: %s\r\n", body);
-    int code = http.POST((uint8_t *)body, strlen(body));
+    int code = 0;
+    for (uint8_t attempt = 1; attempt <= WEATHER_HUB_ATTEMPTS; ++attempt) {
+        code = attemptPush(body);
+        if (code == 200 || !worthRetrying(code)) break;
+        if (attempt < WEATHER_HUB_ATTEMPTS) {
+            Serial.printf("Retrying hub push (attempt %u of %u)\r\n",
+                          (unsigned)(attempt + 1), (unsigned)WEATHER_HUB_ATTEMPTS);
+            delay(WEATHER_HUB_RETRY_DELAY_MS);
+        }
+    }
+
     if (code == 200) {
         rtcPushOk++;
         Serial.printf("Hub push ok (%lu ok / %lu failed over %lu wakes)\r\n",
                       rtcPushOk, rtcPushFailed, rtcWakeCount);
-    } else if (code > 0) {
-        // The hub explains rejections in the body, and this is read off a
-        // serial console with no debugger attached.
-        rtcPushFailed++;
-        Serial.printf("Hub push rejected: HTTP %d %s\r\n", code, http.getString().c_str());
     } else {
         rtcPushFailed++;
-        Serial.printf("Hub push failed: %s\r\n", HTTPClient::errorToString(code).c_str());
     }
-    http.end();
 }
 
 // ---------------------------------------------------------------------------
