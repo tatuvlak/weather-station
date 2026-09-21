@@ -52,9 +52,25 @@
 // the hub's WEATHER_STALE_AFTER above this, or every reading arrives "stale".
 #define SENSOR_SLEEP_SECONDS 300
 
-// How long to run the PMS fan before reading it. The datasheet wants ~30s for
-// the airflow and the laser chamber to settle.
-#define PMS_WARMUP_SECONDS 30
+// How long to run the PMS fan before reading it, once per wake.
+//
+// This is the main lever on fan life, and it trades directly against reading
+// quality. The module is held in reset during deep sleep, so it genuinely
+// cold-starts every cycle — the datasheet's ~30s is the floor for the airflow
+// and laser chamber to settle from cold, and readings taken right at it came
+// back suspiciously at 0.0.
+//
+// At 45s with a 300s sleep the fan runs ~13% of the time: roughly 7 years out
+// of a part rated for 8000 hours. 30s would be ~11 years but reads sooner;
+// 60s settles further and buys nothing over the two 30s warm-ups this
+// replaced. Tune from the history in the hub rather than from theory.
+#define PMS_WARMUP_SECONDS 45
+
+// How long to stay awake after publishing, before deep sleep, so the Matter
+// stack can actually get the report out to the fabric. It is also the only
+// window in which the BOOT button's decommission long-press can be noticed,
+// since the rest of the wake is spent blocked on the PMS warm-up.
+#define MATTER_SETTLE_SECONDS 10
 
 // PMS5003 serial pins, named from the ESP32's point of view. The module's TX
 // pad goes to the pin we receive on; its RX pad to the pin we transmit on.
