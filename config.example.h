@@ -19,9 +19,21 @@
 // back or command the displays, which is why it is safe on a device on a shelf.
 #define WEATHER_HUB_TOKEN "paste-your-INGEST_TOKEN-here"
 
-// Give up quickly. The device's job is Matter; posting is a bonus and must
-// never hold up the wake cycle.
-#define WEATHER_HUB_TIMEOUT_MS 4000
+// How long to wait on the hub before giving up. This started at 4000ms on the
+// reasoning that posting is a bonus and must never hold up the wake cycle —
+// too miserly in practice. The device is awake about 70s anyway, and a NAS
+// busy with a RAID scrub blew straight through 4s, losing every reading for
+// the duration. Ten seconds costs nothing against a 70s wake.
+#define WEATHER_HUB_TIMEOUT_MS 10000
+
+// How many times to try posting before giving up on the cycle. Only transport
+// failures and 5xx are retried: a 4xx means the hub is rejecting the request
+// itself, and repeating it would just burn the wake window.
+#define WEATHER_HUB_ATTEMPTS 2
+
+// Pause between attempts. Long enough for a moment's congestion to pass,
+// short enough not to matter.
+#define WEATHER_HUB_RETRY_DELAY_MS 1500
 
 // How long to wait after waking for Wi-Fi to reassociate before giving up on
 // the push. The Matter stack reconnects from NVS on its own; this only decides
