@@ -187,13 +187,31 @@ static bool canFallBack(uint32_t ageWakes) {
 // Read the PMS, retrying a couple of times before giving up. A single miss is
 // common; several in a row on a warmed-up sensor is a real fault.
 static bool readPms(PMS::DATA &out, uint8_t attempts = 3) {
+    // Throw the first answer away. In passive mode the module replies with
+    // what it has buffered, which even after the warm-up can be a frame
+    // measured before the fan reached speed. Logged rather than silently
+    // dropped: if this frame differs from the one kept, that confirms the
+    // first-read theory; if they match, the problem is elsewhere.
+    pms.requestRead();
+    if (pms.readUntil(out)) {
+        Serial.printf("PMS priming frame (discarded): %u / %u / %u\r\n",
+                      out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0);
+    } else {
+        Serial.println("PMS priming frame: no answer");
+    }
+    delay(500);
+
     for (uint8_t i = 1; i <= attempts; ++i) {
         pms.requestRead();
         if (pms.readUntil(out)) {
-            if (i > 1) Serial.printf("PMS read succeeded on attempt %u\r\n", i);
+            Serial.printf("PMS frame on attempt %u: %u / %u / %u\r\n",
+                          i, out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0);
             return true;
         }
         Serial.printf("PMS read attempt %u of %u failed\r\n", i, attempts);
+        // A failed read usually means a frame was mid-flight. Give the line a
+        // moment rather than immediately asking again over the top of it.
+        delay(500);
     }
     return false;
 }
@@ -434,11 +452,41 @@ static void releasePmsHold() {
         rtc_gpio_hold_dis(rst);
         rtc_gpio_deinit(rst);   // back to the digital mux
     }
-    // Out of reset, then a moment to boot before the UART talks to it. It
-    // comes up in active mode; setup() sends passiveMode() again right after.
+    // Out of reset, then time to boot before the UART talks to it. 100ms was
+    // not enough: the module comes up in active mode, and a passiveMode()
+    // command sent before its MCU is listening is simply dropped. See
+    // enterPassiveMode(), which no longer takes that on trust.
     pinMode(PMS_RST_PIN, OUTPUT);
     digitalWrite(PMS_RST_PIN, HIGH);
-    delay(100);
+    delay(1000);
+}
+
+// Put the module into passive mode, and verify it actually got there.
+//
+// This is the suspected cause of every reading coming back 0.0 since the
+// module started being held in reset through deep sleep. It boots into ACTIVE
+// mode, where it streams a frame roughly once a second unbidden. If
+// passiveMode() is dropped, requestRead() means nothing and readUntil() just
+// grabs whatever frame is in flight — and seconds after a cold start, with the
+// fan still spinning up, that frame reads zero.
+//
+// There is no command to ask the module which mode it is in, but active mode
+// announces itself: drain the line, wait longer than its streaming period, and
+// see whether anything arrives on its own.
+static bool enterPassiveMode(uint8_t attempts = 3) {
+    for (uint8_t i = 1; i <= attempts; ++i) {
+        pms.passiveMode();
+        delay(300);
+        while (pmsSerial.available()) pmsSerial.read();   // drain anything buffered
+        delay(1500);                                      // longer than the ~1s active period
+        if (!pmsSerial.available()) {
+            Serial.printf("PMS in passive mode (attempt %u)\r\n", i);
+            return true;
+        }
+        Serial.printf("PMS still streaming after passiveMode() attempt %u - retrying\r\n", i);
+    }
+    Serial.println("PMS would not enter passive mode - reads may return stale frames");
+    return false;
 }
 
 void setup()
@@ -499,7 +547,7 @@ void setup()
     // Release last cycle's latches and bring the PMS out of reset.
     releasePmsHold();
     pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_UART_RX_PIN, PMS_UART_TX_PIN);
-    pms.passiveMode();
+    enterPassiveMode();
  
 // CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
 #if !CONFIG_ENABLE_CHIPOBLE
