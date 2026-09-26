@@ -194,8 +194,9 @@ static bool readPms(PMS::DATA &out, uint8_t attempts = 3) {
     // first-read theory; if they match, the problem is elsewhere.
     pms.requestRead();
     if (pms.readUntil(out)) {
-        Serial.printf("PMS priming frame (discarded): %u / %u / %u\r\n",
-                      out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0);
+        Serial.printf("PMS priming frame (discarded): AE %u / %u / %u  SP %u / %u / %u\r\n",
+                      out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0,
+                      out.PM_SP_UG_1_0, out.PM_SP_UG_2_5, out.PM_SP_UG_10_0);
     } else {
         Serial.println("PMS priming frame: no answer");
     }
@@ -204,8 +205,12 @@ static bool readPms(PMS::DATA &out, uint8_t attempts = 3) {
     for (uint8_t i = 1; i <= attempts; ++i) {
         pms.requestRead();
         if (pms.readUntil(out)) {
-            Serial.printf("PMS frame on attempt %u: %u / %u / %u\r\n",
-                          i, out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0);
+            // Both fields are logged on purpose. A frame that parses and
+            // checksums but reads zero in BOTH is a module that is talking and
+            // not sensing - the laser, not the code.
+            Serial.printf("PMS frame on attempt %u: AE %u / %u / %u  SP %u / %u / %u\r\n",
+                          i, out.PM_AE_UG_1_0, out.PM_AE_UG_2_5, out.PM_AE_UG_10_0,
+                          out.PM_SP_UG_1_0, out.PM_SP_UG_2_5, out.PM_SP_UG_10_0);
             return true;
         }
         Serial.printf("PMS read attempt %u of %u failed\r\n", i, attempts);
@@ -544,10 +549,11 @@ void setup()
                       rtcWakeCount);
     }
 
-    // Release last cycle's latches and bring the PMS out of reset.
+    // Release last cycle's latches and bring the PMS out of reset. The module
+    // comes up in ACTIVE mode and starts streaming; it is left that way until
+    // just before the read — see enterPassiveMode() below.
     releasePmsHold();
     pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_UART_RX_PIN, PMS_UART_TX_PIN);
-    enterPassiveMode();
  
 // CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
 #if !CONFIG_ENABLE_CHIPOBLE
@@ -582,6 +588,20 @@ void setup()
     float temperature = wakeReading.temperature;
     float pressure = wakeReading.pressure;
     float humidity = wakeReading.humidity;
+
+    // Passive mode goes here, immediately before the read, and nowhere else.
+    //
+    // It used to be set right after the module came out of reset - before the
+    // WiFi connect, before pms.wakeUp(), and a full warm-up before the read.
+    // Two things then sat between setting the mode and relying on it, and
+    // pms.wakeUp() is documented to return the module to its default reporting
+    // state. The mode check would pass, the module would go back to streaming
+    // on its own, and requestRead() would be talking to something that was no
+    // longer listening for it.
+    //
+    // Whether or not wakeUp() was the culprit, a mode that has to hold across
+    // 45 seconds and a network connection is a mode worth setting later.
+    enterPassiveMode();
 
     Serial.println("Setup Reading PMS data");
     if (readPms(data))
