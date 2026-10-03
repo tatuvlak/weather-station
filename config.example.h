@@ -60,11 +60,19 @@
 // and laser chamber to settle from cold, and readings taken right at it came
 // back suspiciously at 0.0.
 //
-// At 45s with a 300s sleep the fan runs ~13% of the time: roughly 7 years out
-// of a part rated for 8000 hours. 30s would be ~11 years but reads sooner;
-// 60s settles further and buys nothing over the two 30s warm-ups this
-// replaced. Tune from the history in the hub rather than from theory.
-#define PMS_WARMUP_SECONDS 45
+// 60s is measured, not guessed. test/PmsBench ran this module from cold in
+// ordinary indoor air on 2026-10-03:
+//
+//   0-30s   AE 0 / 0 / 0        nothing at all
+//   32s     AE 0 / 1 / 6        first non-zero
+//   45s     AE 24 / 35 / 42     within ~10% of the plateau
+//   58s+    AE 27 / 39 / 48     plateau, steady for six minutes
+//
+// 45s read about 10% low. 30s would have read zero. At 60s with a 300s sleep
+// the fan runs 17% of the time: about 5.5 years out of a part rated for 8000
+// hours. Re-run the bench before trading accuracy back for fan life, and tune
+// from the history in the hub rather than from theory.
+#define PMS_WARMUP_SECONDS 60
 
 // How long to stay awake after publishing, before deep sleep, so the Matter
 // stack can actually get the report out to the fabric. It is also the only

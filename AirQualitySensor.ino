@@ -466,6 +466,30 @@ static void releasePmsHold() {
     delay(1000);
 }
 
+// Throw away everything the module streamed during the warm-up.
+//
+// THIS is why every reading came back 0.0. The module boots into active mode
+// and streams a frame a second from the moment it leaves reset, so a 45-second
+// warm-up pushes about 45 frames at the UART. The driver's receive buffer holds
+// the first eight or so and the hardware discards the rest - new bytes are
+// dropped when it is full, the buffered ones are not overwritten. So the first
+// frame any read gets back is the OLDEST one: measured seconds after the fan
+// started, when the module genuinely was reading zero.
+//
+// Measured on this module with test/PmsBench: nothing at all for the first 30
+// seconds, 24/35/42 at 45s, a 27/39/48 plateau from about a minute. Every one
+// of those early zeros is a well-formed frame. Nothing downstream can tell
+// them from clean air, which is exactly how this survived a fortnight.
+//
+// It also explains the timing: this began when the module started being held
+// in reset through deep sleep. Before that it never cold-started, so even the
+// stalest buffered frame carried a real measurement.
+static void drainPmsSerial() {
+    uint16_t dropped = 0;
+    while (pmsSerial.available()) { pmsSerial.read(); ++dropped; }
+    if (dropped) Serial.printf("Dropped %u stale PMS byte(s) from the warm-up\r\n", dropped);
+}
+
 // Put the module into passive mode, and verify it actually got there.
 //
 // This is the suspected cause of every reading coming back 0.0 since the
@@ -589,18 +613,24 @@ void setup()
     float pressure = wakeReading.pressure;
     float humidity = wakeReading.humidity;
 
-    // Passive mode goes here, immediately before the read, and nowhere else.
+    // Order matters here, and both of these are the fix.
     //
-    // It used to be set right after the module came out of reset - before the
-    // WiFi connect, before pms.wakeUp(), and a full warm-up before the read.
-    // Two things then sat between setting the mode and relying on it, and
-    // pms.wakeUp() is documented to return the module to its default reporting
-    // state. The mode check would pass, the module would go back to streaming
-    // on its own, and requestRead() would be talking to something that was no
-    // longer listening for it.
+    // Drain first: the warm-up has left a buffer full of frames measured while
+    // the fan was still spinning up, and the oldest of them is what a read
+    // would otherwise return. See drainPmsSerial().
+    drainPmsSerial();
+
+    // Then passive mode, immediately before the read and nowhere else. It used
+    // to be set right after the module came out of reset - before the WiFi
+    // connect, before pms.wakeUp(), and a full warm-up before the read. Two
+    // things sat between setting the mode and relying on it, and pms.wakeUp()
+    // is documented to return the module to its default reporting state. The
+    // check would pass, the module would go back to streaming on its own, and
+    // requestRead() would be talking to something no longer listening for it.
     //
-    // Whether or not wakeUp() was the culprit, a mode that has to hold across
-    // 45 seconds and a network connection is a mode worth setting later.
+    // enterPassiveMode() drains as part of its own check, so this is belt and
+    // braces - but the drain is the thing that fixes the zeros, and it should
+    // not be a side effect of a function named for something else.
     enterPassiveMode();
 
     Serial.println("Setup Reading PMS data");
