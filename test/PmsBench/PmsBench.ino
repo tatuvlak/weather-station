@@ -36,6 +36,20 @@
  * flowing. A working module reacts within seconds and climbs into the
  * hundreds. One that answers every frame with a flat zero through that is not
  * measuring anything.
+ *
+ * What it measured here, 2026-10-03
+ * ---------------------------------
+ * This module senses correctly. From a cold start, in ordinary indoor air:
+ *
+ *   0-30s   AE 0 / 0 / 0            nothing at all
+ *   32s     AE 0 / 1 / 6            first non-zero
+ *   35s     AE 1 / 10 / 15          climbing fast, still badly low
+ *   45s     AE 24 / 35 / 42         within about 10% of the plateau
+ *   58s+    AE 27 / 39 / 48         plateau, steady for the next six minutes
+ *
+ * So the module needs roughly a minute, and anything read in the first 30
+ * seconds is a zero that looks exactly like clean air. PMS_WARMUP_SECONDS is
+ * set from these numbers.
  */
 
 #include <HardwareSerial.h>
@@ -52,6 +66,7 @@ PMS pms(pmsSerial);
 PMS::DATA data;
 
 static unsigned long startedAt = 0;
+static unsigned long lastFrameAt = 0;
 static unsigned long frames = 0;
 static unsigned long nonZeroFrames = 0;
 
@@ -76,22 +91,31 @@ void setup() {
     Serial.println("Give it two minutes, then breathe on the inlet.");
     Serial.println();
     startedAt = millis();
+    lastFrameAt = startedAt;
 }
 
 void loop() {
     if (!pms.read(data)) {
-        // No complete frame yet. Say so every 10s rather than every pass, so a
-        // dead line is obvious without drowning a live one.
-        static unsigned long lastGrumble = 0;
-        if (millis() - lastGrumble > 10000UL) {
-            lastGrumble = millis();
-            Serial.printf("[%6lus] no frame in the last 10s "
+        // PMS::read() consumes ONE byte per call and returns true only on the
+        // byte that completes a frame. So 31 of every 32 calls return false in
+        // normal operation, and this branch is the hot path, not the error
+        // path. Delaying here throttled parsing to about 20 bytes a second
+        // against a 32-byte-a-second stream: the driver's receive buffer
+        // filled, the UART dropped the overflow, and frames went from one
+        // every second to one every twenty. That looked like failing hardware
+        // and was this sketch starving itself. No delay now - spin.
+        //
+        // Judge a quiet line by when a frame last COMPLETED, not by this
+        // branch being taken.
+        if (millis() - lastFrameAt > 10000UL) {
+            lastFrameAt = millis();
+            Serial.printf("[%6lus] no complete frame for 10s "
                           "(check TX/RX are not swapped, and RST is high)\r\n",
                           (millis() - startedAt) / 1000UL);
         }
-        delay(50);
         return;
     }
+    lastFrameAt = millis();
 
     frames++;
     const bool anyNonZero =
