@@ -45,6 +45,30 @@ print("prototype ordering")
 print("  ok  struct Reading (line %d) precedes the first function (line %d)"
       % (struct_at, func_at))
 
+# config.h is gitignored, so it does not arrive with a pull. A knob added to
+# config.example.h without a fallback in the sketch therefore breaks the build
+# for whoever has a real config.h - and does it with an error naming the line
+# that uses the macro, not the file that is missing it. Twice now.
+#
+# So every tuning knob must have an #ifndef default in the sketch. The ones
+# listed here are required on purpose: a silently wrong URL, token or pin is
+# worse than a failed build.
+MUST_BE_PROVIDED = {
+    "WEATHER_HUB_URL", "WEATHER_HUB_TOKEN",
+    "WIFI_SSID", "WIFI_PASSWORD",
+    "PMS_UART_RX_PIN", "PMS_UART_TX_PIN", "PMS_RST_PIN",
+}
+example = pathlib.Path("../config.example.h").read_text()
+knobs = set(re.findall(r"^#define\s+(\w+)", example, re.M)) - MUST_BE_PROVIDED
+missing = sorted(k for k in knobs if ("#ifndef %s" % k) not in src)
+if missing:
+    sys.exit(
+        "these config knobs have no #ifndef default in the sketch, so a config.h\n"
+        "that predates them will not compile:\n  " + "\n  ".join(missing))
+print("config defaults")
+print("  ok  all %d tuning knob(s) have a fallback; %d required by design"
+      % (len(knobs), len(MUST_BE_PROVIDED)))
+
 start = src.index("static void appendField")
 end = src.index("// Has the station got an address yet?")
 pathlib.Path("extracted.inc").write_text(src[start:end])

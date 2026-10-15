@@ -13,6 +13,11 @@
 // ---------------------------------------------------------------------------
 // The QNAP service's /ingest endpoint. This is the path that replaces reading
 // the sensor back out of the SmartThings cloud.
+// Every numeric knob below also has an #ifndef default in the sketch, so a
+// config.h written before a knob existed still compiles - the sketch just uses
+// its own value. The URL, the token and the pins have no defaults on purpose: a
+// silently wrong one is worse than a failed build. test/run.sh enforces this.
+//
 #define WEATHER_HUB_URL "http://winston:5000/ingest"
 
 // The INGEST_TOKEN from the hub's .env. Write access only — it cannot read data
