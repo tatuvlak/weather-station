@@ -3,4 +3,7 @@ config.h
 
 # Test build artefacts
 test/harness
+test/backlog_harness
 test/extracted.inc
+test/backlog.inc
+test/backlog_state.inc

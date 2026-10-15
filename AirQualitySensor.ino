@@ -110,8 +110,64 @@ struct Reading {
     float pm25 = NAN;
     float pm10 = NAN;
     bool  havePms = false;
+    // The air-quality enum used to be fetched from weatherStation at the moment
+    // the JSON was built. A backlogged reading is sent minutes or hours later,
+    // by which time weatherStation holds a different wake's PM values, so the
+    // enum has to travel with the reading that produced it.
+    int8_t aqi = -1;             // -1: not computed, omit from the payload
+    // Seconds between this reading being taken and it being sent. Zero for the
+    // reading of the current wake; non-zero only when the backlog is draining,
+    // where it is what lets the hub file the row under the time it was
+    // measured rather than the time it finally arrived.
+    uint32_t ageS = 0;
+    // Did the PMS reset line actually hold the module in reset through the
+    // last sleep? -1 until the first check has run. See checkPmsHold().
+    int8_t pmsHoldOk = -1;
 };
 Reading wakeReading;
+
+// ---------------------------------------------------------------------------
+// Readings the hub did not take
+// ---------------------------------------------------------------------------
+// The hub is one service on one NAS, and it has been down twice. A reading that
+// cannot be posted used to be simply lost, leaving a hole in the history that
+// nothing could fill afterwards. Hold the unsent ones in RTC memory instead and
+// drain them once the hub answers again.
+//
+// RTC memory survives deep sleep but not a power cut, which is the right
+// trade here: this covers a NAS reboot, not a blackout.
+struct PendingReading {
+    uint32_t uptimeS = 0;        // when it was taken, on the clock below
+    float temperature = NAN;
+    float humidity = NAN;
+    float pressure = NAN;
+    float pm1 = NAN;
+    float pm25 = NAN;
+    float pm10 = NAN;
+    int8_t aqi = -1;
+    bool havePms = false;
+};
+RTC_DATA_ATTR PendingReading rtcBacklog[WEATHER_BACKLOG_SLOTS];
+RTC_DATA_ATTR uint8_t rtcBacklogHead = 0;    // index of the oldest entry
+RTC_DATA_ATTR uint8_t rtcBacklogCount = 0;
+RTC_DATA_ATTR uint32_t rtcBacklogDropped = 0;
+
+// A seconds counter that survives deep sleep.
+//
+// millis() restarts at zero every wake, and the station has no idea what time
+// it is - it never asks an NTP server, and Matter does not hand it a clock it
+// can read. So the backlog cannot stamp a reading with a wall-clock time. What
+// it can do is count elapsed seconds and tell the hub how OLD a reading is;
+// the hub knows the time and does the subtraction.
+//
+// Accumulated explicitly rather than read from the RTC: the sleep duration is
+// configured, the awake time is measured, and both are added on as they happen,
+// which is easy to reason about and needs nothing from the ESP-IDF time layer.
+RTC_DATA_ATTR uint32_t rtcUptimeS = 0;
+
+static uint32_t uptimeNow() {
+    return rtcUptimeS + (uint32_t)(millis() / 1000UL);
+}
 
 // Helper function to update the identity
 void updateMatterIdentity() {
@@ -284,11 +340,16 @@ static bool buildReadingJson(char *buf, size_t size, const Reading &r) {
         appendField(buf, size, off, first, "pm10", "%.1f", r.pm10);
         // The air-quality enum only means anything alongside the PM values it
         // was derived from, so it travels with them.
-        appendField(buf, size, off, first, "aqi", "%.0f",
-                    (double)weatherStation.getAirQualityEnum());
+        if (r.aqi >= 0) appendField(buf, size, off, first, "aqi", "%.0f", (double)r.aqi);
     }
 
     if (first) return false;            // nothing measured; nothing to send
+
+    // Metadata, appended only once there is a reading to attach it to. Neither
+    // of these is a measurement, and the hub treats both as optional.
+    if (r.ageS > 0)      appendField(buf, size, off, first, "age_s", "%.0f", (double)r.ageS);
+    if (r.pmsHoldOk >= 0) appendField(buf, size, off, first, "pms_hold_ok", "%.0f", (double)r.pmsHoldOk);
+
     if (off + 2 > size) return false;   // no room to close the object
     buf[off++] = '}';
     buf[off] = '\0';
@@ -366,7 +427,105 @@ static bool worthRetrying(int code) {
     return code < 0 || code >= 500;
 }
 
+// Keep a reading the hub would not take.
+//
+// When the ring is full the OLDEST entry goes, not the newest. A six-hour
+// outage should leave the most recent hours behind, not the first few minutes
+// of it. Drops are counted so the log can say the history has a hole rather
+// than quietly pretending otherwise.
+static void enqueueBacklog(const Reading &r, uint32_t takenAtS) {
+    if (rtcBacklogCount >= WEATHER_BACKLOG_SLOTS) {
+        rtcBacklogHead = (uint8_t)((rtcBacklogHead + 1) % WEATHER_BACKLOG_SLOTS);
+        rtcBacklogCount = WEATHER_BACKLOG_SLOTS - 1;
+        rtcBacklogDropped++;
+    }
+    PendingReading &slot = rtcBacklog[(rtcBacklogHead + rtcBacklogCount) % WEATHER_BACKLOG_SLOTS];
+    slot.uptimeS = takenAtS;
+    slot.temperature = r.temperature;
+    slot.humidity = r.humidity;
+    slot.pressure = r.pressure;
+    slot.pm1 = r.pm1;
+    slot.pm25 = r.pm25;
+    slot.pm10 = r.pm10;
+    slot.aqi = r.aqi;
+    slot.havePms = r.havePms;
+    rtcBacklogCount++;
+    Serial.printf("Reading held for later (%u in the backlog, %lu dropped so far)\r\n",
+                  (unsigned)rtcBacklogCount, rtcBacklogDropped);
+}
+
+// One POST, with the retry policy that distinguishes "the NAS is busy" from
+// "the request itself is wrong".
+static bool postWithRetries(const char *body, uint8_t attempts) {
+    int code = 0;
+    for (uint8_t attempt = 1; attempt <= attempts; ++attempt) {
+        code = attemptPush(body);
+        if (code == 200 || !worthRetrying(code)) break;
+        if (attempt < attempts) {
+            Serial.printf("Retrying hub push (attempt %u of %u)\r\n",
+                          (unsigned)(attempt + 1), (unsigned)attempts);
+            delay(WEATHER_HUB_RETRY_DELAY_MS);
+        }
+    }
+    return code == 200;
+}
+
+// Send what is waiting, oldest first, and stop at the first refusal.
+//
+// Only called after the current reading has gone through, so the hub is known
+// to be answering. Bounded per wake: the wake window is finite and the fresh
+// reading matters more than the old ones, so a long backlog drains over
+// several cycles rather than holding one wake open.
+//
+// A single attempt each. If the hub starts refusing mid-drain it is going down
+// again, and the entries stay queued for next time either way.
+static void flushBacklog() {
+    uint8_t sent = 0;
+    while (rtcBacklogCount > 0 && sent < WEATHER_BACKLOG_FLUSH_PER_WAKE) {
+        const PendingReading &slot = rtcBacklog[rtcBacklogHead];
+
+        Reading old;
+        old.temperature = slot.temperature;
+        old.humidity = slot.humidity;
+        old.pressure = slot.pressure;
+        old.pm1 = slot.pm1;
+        old.pm25 = slot.pm25;
+        old.pm10 = slot.pm10;
+        old.aqi = slot.aqi;
+        old.havePms = slot.havePms;
+        // How long ago it was measured. The hub subtracts this from its own
+        // clock, so a backfilled row lands at the time of the reading rather
+        // than the time the NAS came back. At least 1s, since zero is the
+        // payload's way of saying "now".
+        uint32_t age = uptimeNow() - slot.uptimeS;
+        old.ageS = age > 0 ? age : 1;
+
+        char body[224];
+        if (!buildReadingJson(body, sizeof(body), old)) {
+            // Cannot happen for an entry that was accepted into the ring, but
+            // dropping it beats looping on it forever.
+            Serial.println("Backlog entry could not be encoded - discarding it");
+        } else {
+            Serial.printf("Backfilling a reading from %lus ago: %s\r\n", age, body);
+            if (!postWithRetries(body, 1)) {
+                Serial.printf("Backfill refused - %u reading(s) still held\r\n",
+                              (unsigned)rtcBacklogCount);
+                return;
+            }
+        }
+        rtcBacklogHead = (uint8_t)((rtcBacklogHead + 1) % WEATHER_BACKLOG_SLOTS);
+        rtcBacklogCount--;
+        sent++;
+    }
+    if (sent) {
+        Serial.printf("Backfilled %u reading(s), %u still held\r\n",
+                      (unsigned)sent, (unsigned)rtcBacklogCount);
+    }
+}
+
 static void pushReading(const Reading &r) {
+    uint32_t takenAtS = uptimeNow();
+
     char body[224];
     if (!buildReadingJson(body, sizeof(body), r)) {
         Serial.println("Hub push skipped: nothing measured this cycle");
@@ -375,27 +534,20 @@ static void pushReading(const Reading &r) {
 
     if (!waitForWifi(WEATHER_WIFI_WAIT_MS)) {
         rtcPushFailed++;
+        enqueueBacklog(r, takenAtS);
         return;
     }
 
     Serial.printf("Hub push: %s\r\n", body);
-    int code = 0;
-    for (uint8_t attempt = 1; attempt <= WEATHER_HUB_ATTEMPTS; ++attempt) {
-        code = attemptPush(body);
-        if (code == 200 || !worthRetrying(code)) break;
-        if (attempt < WEATHER_HUB_ATTEMPTS) {
-            Serial.printf("Retrying hub push (attempt %u of %u)\r\n",
-                          (unsigned)(attempt + 1), (unsigned)WEATHER_HUB_ATTEMPTS);
-            delay(WEATHER_HUB_RETRY_DELAY_MS);
-        }
-    }
-
-    if (code == 200) {
+    if (postWithRetries(body, WEATHER_HUB_ATTEMPTS)) {
         rtcPushOk++;
         Serial.printf("Hub push ok (%lu ok / %lu failed over %lu wakes)\r\n",
                       rtcPushOk, rtcPushFailed, rtcWakeCount);
+        // The hub is up. Anything held from an earlier outage can go now.
+        flushBacklog();
     } else {
         rtcPushFailed++;
+        enqueueBacklog(r, takenAtS);
     }
 }
 
@@ -490,6 +642,49 @@ static void drainPmsSerial() {
     if (dropped) Serial.printf("Dropped %u stale PMS byte(s) from the warm-up\r\n", dropped);
 }
 
+// Did the reset line actually hold the module off through the last sleep?
+//
+// A loose RST wire is invisible: holdPmsOff() drives GPIO3 low and latches it,
+// and with nothing on the other end that succeeds silently. The fan then runs
+// for the whole sleep — 100mA and the fan's rated life, spent for nothing — and
+// the only symptom is a noise you have to be standing next to the sensor to
+// hear. That is how it went unnoticed here.
+//
+// The check costs nothing and needs no serial console. Call it at the START of
+// a wake, before releasePmsHold(), while the pin is still latched low:
+//
+//   RST working      the module is in reset, and a module in reset says
+//                    nothing at all -> the line stays silent
+//   RST disconnected the module has been running in active mode for the whole
+//                    sleep, streaming a frame a second -> bytes are waiting
+//
+// The verdict rides along on the next hub push, because a log line on a sensor
+// mounted outside with only a power lead is no use to anybody.
+//
+// One blind spot, in the harmless direction: if the module were disconnected
+// AND had stayed asleep from the previous pms.sleep(), it would also be silent
+// and this would report healthy. But then the fan is not running, which is the
+// only thing being guarded against.
+static int8_t checkPmsHold() {
+    if (rtcWakeCount <= 1) {
+        // First wake after a flash or a power cut: no sleep has happened yet,
+        // so there is nothing to have held.
+        Serial.println("PMS hold check skipped on the first wake");
+        return -1;
+    }
+    while (pmsSerial.available()) pmsSerial.read();
+    delay(PMS_HOLD_CHECK_MS);
+    if (pmsSerial.available()) {
+        Serial.printf("PMS RESET LINE NOT WORKING - module still streaming %u byte(s) "
+                      "while GPIO%d is held low. Check the wire to the module's RST pin; "
+                      "the fan has been running all through the sleep.\r\n",
+                      (unsigned)pmsSerial.available(), PMS_RST_PIN);
+        return 0;
+    }
+    Serial.println("PMS hold verified: silent while held in reset");
+    return 1;
+}
+
 // Put the module into passive mode, and verify it actually got there.
 //
 // This is the suspected cause of every reading coming back 0.0 since the
@@ -546,6 +741,10 @@ void setup()
     // radio and the PMS fan only warm it from here on. This one reading is used
     // for Matter and for the hub push; nothing re-reads it later in the cycle.
     rtcWakeCount++;
+    // Charge the sleep that just ended to the uptime clock. Done here rather
+    // than before sleeping, so a sleep cut short by a reset is not counted as
+    // a full one in a backlogged reading's age.
+    if (rtcWakeCount > 1) rtcUptimeS += SENSOR_SLEEP_SECONDS;
     if (rtcBmeAgeWakes != NEVER_READ) rtcBmeAgeWakes++;
     if (rtcPmsAgeWakes != NEVER_READ) rtcPmsAgeWakes++;
 
@@ -573,11 +772,16 @@ void setup()
                       rtcWakeCount);
     }
 
-    // Release last cycle's latches and bring the PMS out of reset. The module
-    // comes up in ACTIVE mode and starts streaming; it is left that way until
-    // just before the read — see enterPassiveMode() below.
-    releasePmsHold();
+    // The UART comes up BEFORE the reset is released, so checkPmsHold() can
+    // listen while the module should still be held off. Releasing first would
+    // destroy the only evidence there is.
     pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_UART_RX_PIN, PMS_UART_TX_PIN);
+    wakeReading.pmsHoldOk = checkPmsHold();
+
+    // Now bring the PMS out of reset. The module comes up in ACTIVE mode and
+    // starts streaming; it is left that way until just before the read — see
+    // enterPassiveMode() below.
+    releasePmsHold();
  
 // CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
 #if !CONFIG_ENABLE_CHIPOBLE
@@ -744,8 +948,10 @@ void loop()
             weatherStation.setPM1(wakeReading.pm1);
             weatherStation.setPM2_5(wakeReading.pm25);
             weatherStation.setPM10(wakeReading.pm10);
-            // setPM10 was the last setter, so the air-quality enum is current
-            // by the time the hub push reads it.
+            // setPM10 was the last setter, so the enum is current now. Captured
+            // here rather than read at push time, because the backlog can send
+            // this reading long after weatherStation has moved on.
+            wakeReading.aqi = (int8_t)weatherStation.getAirQualityEnum();
             Serial.printf("Published to Matter: PM %.1f / %.1f / %.1f\r\n",
                           wakeReading.pm1, wakeReading.pm25, wakeReading.pm10);
         }
@@ -773,6 +979,10 @@ void loop()
     if (millis() - publishedAt >= (unsigned long)MATTER_SETTLE_SECONDS * 1000UL)
     {
         esp_sleep_enable_timer_wakeup((uint64_t)SENSOR_SLEEP_SECONDS * 1000000ULL);
+        // Charge this wake's awake time before the clock stops ticking, so a
+        // backlogged reading's age counts the whole elapsed interval and not
+        // just the sleeps.
+        rtcUptimeS += (uint32_t)(millis() / 1000UL);
         // Last thing before the lights go out: hold the PMS in reset so its
         // fan stays stopped for the whole sleep.
         holdPmsOff();
