@@ -694,21 +694,37 @@ static void drainPmsSerial() {
 // the only symptom is a noise you have to be standing next to the sensor to
 // hear. That is how it went unnoticed here.
 //
-// The check costs nothing and needs no serial console. Call it at the START of
-// a wake, before releasePmsHold(), while the pin is still latched low:
+// Run at the START of a wake, before releasePmsHold(), while the pin is still
+// latched low. A module genuinely in reset cannot talk. A module that was
+// never reset can.
 //
-//   RST working      the module is in reset, and a module in reset says
-//                    nothing at all -> the line stays silent
-//   RST disconnected the module has been running in active mode for the whole
-//                    sleep, streaming a frame a second -> bytes are waiting
+// ASK it, do not just listen. The first version of this check only listened
+// for a second and a half and called silence a pass, on the reasoning that an
+// unreset module would be streaming a frame a second. Wrong: a module streams
+// unbidden only in ACTIVE mode, which it enters by BOOTING — and not booting
+// is exactly what the disconnected case means. It instead holds the PASSIVE
+// mode that the previous wake's enterPassiveMode() put it in, where it says
+// nothing at all until it is asked. So both cases were silent and the check
+// passed with the wire hanging loose and the fan audibly running.
+//
+// requestRead() distinguishes them, because answering it requires a running
+// module:
+//
+//   held in reset       nothing answers, nothing arrives     -> pass
+//   never reset, passive  answers the request                -> fail
+//   never reset, active   a streamed frame arrives anyway    -> fail
+//
+// passiveMode() first because the library only sends the read request when it
+// believes the module is passive, and after a wake it believes nothing of the
+// sort. Sent to a module in reset it goes nowhere, which is harmless.
 //
 // The verdict rides along on the next hub push, because a log line on a sensor
 // mounted outside with only a power lead is no use to anybody.
 //
-// One blind spot, in the harmless direction: if the module were disconnected
-// AND had stayed asleep from the previous pms.sleep(), it would also be silent
-// and this would report healthy. But then the fan is not running, which is the
-// only thing being guarded against.
+// One blind spot remains, in the harmless direction: a module that is both
+// disconnected and genuinely asleep — pms.sleep() having stuck for once —
+// answers nothing and reads as healthy. But a sleeping module has stopped its
+// fan, which is the only thing being guarded against.
 static int8_t checkPmsHold() {
     if (rtcWakeCount <= 1) {
         // First wake after a flash or a power cut: no sleep has happened yet,
@@ -716,16 +732,23 @@ static int8_t checkPmsHold() {
         Serial.println("PMS hold check skipped on the first wake");
         return -1;
     }
-    while (pmsSerial.available()) pmsSerial.read();
-    delay(PMS_HOLD_CHECK_MS);
-    if (pmsSerial.available()) {
-        Serial.printf("PMS RESET LINE NOT WORKING - module still streaming %u byte(s) "
-                      "while GPIO%d is held low. Check the wire to the module's RST pin; "
-                      "the fan has been running all through the sleep.\r\n",
-                      (unsigned)pmsSerial.available(), PMS_RST_PIN);
+
+    pms.passiveMode();                                // so requestRead() really asks
+    delay(100);
+    while (pmsSerial.available()) pmsSerial.read();   // ignore anything left over
+
+    PMS::DATA probe;
+    pms.requestRead();
+    if (pms.readUntil(probe, PMS_HOLD_CHECK_MS)) {
+        Serial.printf("PMS RESET LINE NOT WORKING - the module answered a read "
+                      "(AE %u / %u / %u) while GPIO%d is held low. Check the wire to "
+                      "the module's RST pin; the fan has been running all through the "
+                      "sleep.\r\n",
+                      probe.PM_AE_UG_1_0, probe.PM_AE_UG_2_5, probe.PM_AE_UG_10_0,
+                      PMS_RST_PIN);
         return 0;
     }
-    Serial.println("PMS hold verified: silent while held in reset");
+    Serial.println("PMS hold verified: no answer while held in reset");
     return 1;
 }
 
