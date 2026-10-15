@@ -38,6 +38,50 @@
 // Hub URL, ingest token and cycle timing. Copy config.example.h to config.h.
 #include "config.h"
 
+// Defaults for every tuning knob, applied only where config.h is silent.
+//
+// config.h is gitignored - it holds the ingest token - so it does not come
+// along with a pull. Adding a knob to config.example.h therefore used to break
+// the build for the one person who has a real config.h, with an error naming
+// the line that uses the macro rather than the file that is missing it. That
+// happened twice before this block existed.
+//
+// So: config.h supplies credentials and overrides, and the sketch always
+// compiles without it saying anything about timing. Anything genuinely
+// required - WEATHER_HUB_URL, the token, the pins - is deliberately NOT given
+// a default: a silently wrong URL or pin is far worse than a failed build.
+// test/run.sh enforces both halves of that rule.
+#ifndef WEATHER_HUB_TIMEOUT_MS
+#define WEATHER_HUB_TIMEOUT_MS 10000
+#endif
+#ifndef WEATHER_HUB_ATTEMPTS
+#define WEATHER_HUB_ATTEMPTS 2
+#endif
+#ifndef WEATHER_HUB_RETRY_DELAY_MS
+#define WEATHER_HUB_RETRY_DELAY_MS 1500
+#endif
+#ifndef WEATHER_WIFI_WAIT_MS
+#define WEATHER_WIFI_WAIT_MS 8000
+#endif
+#ifndef SENSOR_SLEEP_SECONDS
+#define SENSOR_SLEEP_SECONDS 300
+#endif
+#ifndef PMS_WARMUP_SECONDS
+#define PMS_WARMUP_SECONDS 60
+#endif
+#ifndef PMS_HOLD_CHECK_MS
+#define PMS_HOLD_CHECK_MS 1500
+#endif
+#ifndef WEATHER_BACKLOG_SLOTS
+#define WEATHER_BACKLOG_SLOTS 12
+#endif
+#ifndef WEATHER_BACKLOG_FLUSH_PER_WAKE
+#define WEATHER_BACKLOG_FLUSH_PER_WAKE 4
+#endif
+#ifndef MATTER_SETTLE_SECONDS
+#define MATTER_SETTLE_SECONDS 10
+#endif
+
 // Included unconditionally, unlike the block below. Even when the device is
 // commissioned over BLE — so it never calls WiFi.begin() itself — it still runs
 // on Wi-Fi, brought up by the Matter stack from credentials in NVS. We need the
