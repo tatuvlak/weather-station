@@ -79,10 +79,10 @@
 // from the history in the hub rather than from theory.
 #define PMS_WARMUP_SECONDS 60
 
-// How long to listen for PMS frames at the start of a wake, while the reset
-// line should still be holding the module off. Longer than the module's ~1s
-// active-mode reporting period, so silence means silence rather than "between
-// frames". See checkPmsHold().
+// How long to wait for the PMS to answer a read request at the start of a
+// wake, while the reset line should still be holding it off. A running module
+// answers in well under a second; one held in reset never answers at all, so
+// this is the time spent proving a negative. See checkPmsHold().
 #define PMS_HOLD_CHECK_MS 1500
 
 // Readings held in RTC memory when the hub cannot be reached, and how many of
