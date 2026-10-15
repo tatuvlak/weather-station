@@ -74,6 +74,26 @@
 // from the history in the hub rather than from theory.
 #define PMS_WARMUP_SECONDS 60
 
+// How long to listen for PMS frames at the start of a wake, while the reset
+// line should still be holding the module off. Longer than the module's ~1s
+// active-mode reporting period, so silence means silence rather than "between
+// frames". See checkPmsHold().
+#define PMS_HOLD_CHECK_MS 1500
+
+// Readings held in RTC memory when the hub cannot be reached, and how many of
+// them to send per wake once it answers again.
+//
+// 12 slots at a 300s sleep is an hour of outage covered, for about 400 bytes of
+// RTC memory. Beyond that the oldest are dropped: a long outage should cost the
+// beginning of the gap, not the end. Flushing 4 per wake drains that hour over
+// three cycles without holding a wake open on old data at the expense of the
+// fresh reading.
+//
+// RTC memory does not survive a power cut, which is the right limit here: this
+// covers a NAS reboot, not a blackout.
+#define WEATHER_BACKLOG_SLOTS 12
+#define WEATHER_BACKLOG_FLUSH_PER_WAKE 4
+
 // How long to stay awake after publishing, before deep sleep, so the Matter
 // stack can actually get the report out to the fabric. It is also the only
 // window in which the BOOT button's decommission long-press can be noticed,

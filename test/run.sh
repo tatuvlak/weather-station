@@ -48,7 +48,22 @@ print("  ok  struct Reading (line %d) precedes the first function (line %d)"
 start = src.index("static void appendField")
 end = src.index("// Has the station got an address yet?")
 pathlib.Path("extracted.inc").write_text(src[start:end])
+
+# The backlog, lifted the same way. It only runs during a hub outage, on a
+# sensor nobody is watching, so a ring-arithmetic bug would show up as a hole
+# in the history weeks later. backlog_harness.c drives the real code.
+start = src.index("struct PendingReading {")
+end = src.index("static uint32_t uptimeNow() {")
+pathlib.Path("backlog_state.inc").write_text(src[start:end])
+
+start = src.index("// Keep a reading the hub would not take.")
+end = src.index("static void pushReading(")
+pathlib.Path("backlog.inc").write_text(src[start:end])
 PY
 
 g++ -x c++ -o harness harness.c -Wall
 HUB_PATH="$HUB" python3 check_payload.py
+
+echo
+g++ -x c++ -o backlog_harness backlog_harness.c -Wall -include cstdarg
+./backlog_harness
